@@ -13,7 +13,7 @@ import time
 from . import lab
 from .core import request
 
-PROTOCOL = 'v0.12-research-1'
+PROTOCOL = 'v0.13-research-1'
 SEEDS = {'alpha': 'trend-volatility', 'beta': 'reversion-recovery', 'gamma': 'breakout-volume'}
 METRICS = ('mean_net', 'mean_gross', 'mean_stress', 'mean_passive', 'mean_turnover',
            'mean_cost_drag', 'worst_drawdown', 'positive_windows', 'fills', 'diagnosis')
@@ -112,6 +112,62 @@ def variants(p):
     return out
 
 
+def entry_coverage(bars, policy):
+    """Joint and per-rule coverage over the development decisions (not a holdout)."""
+    if policy.predictor:
+        return None
+    f=lab.Features(bars); cols=[f.series(r.feature,r.window) for r in policy.entry]
+    counts=[0]*len(cols); joint=0; observations=0; almost=[0]*len(cols)
+    for i in range(lab.WARMUP,len(bars)):
+        passed=[col[i] is not None and (col[i]>r.threshold if r.op=='gt' else col[i]<r.threshold) for r,col in zip(policy.entry,cols)]
+        observations+=1; joint+=all(passed)
+        for j,ok in enumerate(passed):
+            counts[j]+=ok
+            almost[j]+=all(passed[k] for k in range(len(passed)) if k!=j) and not ok
+    return {'observations':observations,'joint':joint,'rules':[{'rule':asdict(r),'passes':counts[j],'blocked_only_by_this':almost[j]} for j,r in enumerate(policy.entry)]}
+
+
+def ranked_variants(policy, metrics, bars, prior):
+    """Prioritize causal fixes; preserve exploration, never use future promotion data."""
+    choices=variants(policy)
+    if not metrics['fills']:
+        # Holding/cooldown cannot create the first entry. For an ALL entry, loosening
+        # a threshold cannot remove a qualifying observation. Check actual coverage.
+        options=[]
+        base=entry_coverage(bars,policy)
+        for change,v in choices:
+            if not change.startswith('entry '): continue
+            if policy.predictor:
+                # The shared predictor has only a single entry rule.
+                if v.entry[0].threshold<policy.entry[0].threshold: options.append((0,change,v))
+                continue
+            cov=entry_coverage(bars,v)
+            if cov['joint']>base['joint']: options.append((cov['joint'],change,v))
+        # If none of the one-step revisions activates the conjunction, try looser
+        # thresholds explicitly (still one changed rule), not an unrelated exit.
+        if not options and not policy.predictor:
+            for i,r in enumerate(policy.entry):
+                for scale in (2,4,8):
+                    step={'rsi':5,'volume_ratio':.15,'volatility':.002}.get(r.feature,.005)*scale
+                    try:
+                        rr=replace(r,threshold=r.threshold-step if r.op=='gt' else r.threshold+step)
+                        v=replace(policy,entry=policy.entry[:i]+(rr,)+policy.entry[i+1:])
+                        cov=entry_coverage(bars,v)
+                        if cov['joint']>base['joint']: options.append((cov['joint'],f'loosen entry {r.feature}({r.window}) {r.threshold:g} -> {rr.threshold:g}',v))
+                    except ValueError: continue
+        # Prefer activating some opportunities without opening the floodgates.
+        return [(change,v) for _,change,v in sorted(options,key=lambda x:x[0])]
+    # Repeated failures in a direction reduce its priority; they do not outlaw exploration.
+    losses={}
+    for t in prior:
+        if t['control']['policy']['name']!=policy.name: continue
+        key=t['change'].split(' threshold ')[0]
+        if t['comparison']['net_delta']<=0 and t['comparison']['stress_delta']<=0:
+            losses[key]=losses.get(key,0)+1
+    return sorted(choices,key=lambda x:(losses.get(x[0].split(' threshold ')[0],0),
+        0 if metrics['mean_gross']>0 and metrics['mean_net']<=0 and ('hold' in x[0] or 'cooldown' in x[0]) else 1))
+
+
 def connect(path):
     Path(path).parent.mkdir(parents=True,exist_ok=True)
     c=sqlite3.connect(path,timeout=30)
@@ -135,6 +191,12 @@ def connect(path):
 def memory(c, dataset, folds):
     rows=c.execute("SELECT t.report,s.agent FROM trials t JOIN sessions s ON s.id=t.session WHERE t.dataset=? AND t.folds=? AND t.status='complete' ORDER BY t.id DESC LIMIT 40",(dataset,folds)).fetchall()
     return [dict(json.loads(r['report']),agent=r['agent']) for r in rows]
+
+
+def own_history(c,dataset,folds,agent):
+    """Champion selection must not forget older results when prompt memory rolls over."""
+    rows=c.execute("SELECT t.report FROM trials t JOIN sessions s ON s.id=t.session WHERE t.dataset=? AND t.folds=? AND t.status='complete' AND s.agent=? ORDER BY t.id DESC",(dataset,folds,agent))
+    return [json.loads(r[0]) for r in rows]
 
 
 def choose(model, agent, options, evidence):
@@ -195,7 +257,7 @@ def session(path,bars,pair,cutoff,agent,model=None,budget=5,folds=6):
         try:
             for _ in range(budget):
                 prior=memory(c,dataset,folds)
-                own=[x for x in prior if x['agent']==agent and x['variant']['fills']]
+                own=[x for x in own_history(c,dataset,folds,agent) if x['variant']['fills']]
                 # Best measured active variant, with original seed always retained as a control.
                 own.sort(key=lambda x:(x['variant']['mean_net'],x['variant']['mean_stress']),reverse=True)
                 controls=[seed,ridge]
@@ -203,11 +265,15 @@ def session(path,bars,pair,cutoff,agent,model=None,budget=5,folds=6):
                     p=lab.Policy(**own[0]['variant']['policy'])
                     if p.identity not in {v.identity for v in controls}: controls.insert(0,p)
                 seen={(r[0],r[1]) for r in c.execute('SELECT control,variant FROM trials WHERE dataset=? AND folds=?',(dataset,folds))}
+                metrics={x['identity']:x for x in record['baseline']}
+                metrics.update({x['variant']['identity']:x['variant'] for x in own})
+                # The champion includes the seed; an inferior exploration control does not replace it.
+                champions=[x for x in metrics.values() if x['policy']['name']==seed.name and x['fills']]
+                champion=max(champions,key=lambda x:(x['mean_net'],x['mean_stress'])) if champions else metrics[seed.identity]
+                record['champion']=champion
                 menus=[]
                 for p in controls:
-                    choices=variants(p)
-                    if p.predictor or p.name=='reversion-recovery':
-                        choices.sort(key=lambda x: not x[0].startswith('entry'))
+                    choices=ranked_variants(p,metrics[p.identity],bars,prior)
                     menus.append([{'control':p,'variant':v,'change':change} for change,v in choices if (p.identity,v.identity) not in seen])
                 # Round-robin to give signal, exit and predictor research a chance.
                 options=[]
@@ -218,7 +284,7 @@ def session(path,bars,pair,cutoff,agent,model=None,budget=5,folds=6):
                 if not options:
                     status='exhausted'; break
                 evidence={'baseline':record['baseline'],'diagnostics':diagnostics,'controls':[{'id':p.identity[:12],'policy':p.description()} for p in controls],
-                          'recent_shared_trials':[{'agent':x['agent'],'change':x['change'],'control':x['control']['identity'][:12],
+                          'champion':champion,'entry_coverage':entry_coverage(bars,seed),'recent_shared_trials':[{'agent':x['agent'],'change':x['change'],'control':x['control']['identity'][:12],
                             'variant':x['variant']['identity'][:12],'metrics':{k:x['variant'][k] for k in METRICS},
                             'comparison':x['comparison']} for x in prior[:4]]}
                 selected,reason=choose(model,agent,options,evidence)
@@ -246,6 +312,9 @@ def session(path,bars,pair,cutoff,agent,model=None,budget=5,folds=6):
             record['error']=str(exc)
             raise
         finally:
+            candidates=record['baseline']+[x['variant'] for x in own_history(c,dataset,folds,agent)]
+            candidates=[x for x in candidates if x['policy']['name']==seed.name and x['fills']]
+            if candidates: record['champion']=max(candidates,key=lambda x:(x['mean_net'],x['mean_stress']))
             record.update(status=status,completed_trials=len(completed),trials=completed)
             with c: c.execute('UPDATE sessions SET status=?,report=? WHERE id=?',(status,json.dumps(record,allow_nan=False),sid))
     return record
@@ -260,7 +329,10 @@ def main():
     sub.add_parser('status'); t=sub.add_parser('trial'); t.add_argument('id',type=int)
     x=p.parse_args()
     if x.cmd=='run':
-        result=session(x.db,lab.csv_history(x.csv,x.cutoff),x.pair,x.cutoff,x.agent,x.model,x.budget,x.folds)
+        from .coordinator import exclusive, recover
+        with exclusive(str(Path(x.db).resolve())+'.lock'):
+            recover(x.db)
+            result=session(x.db,lab.csv_history(x.csv,x.cutoff),x.pair,x.cutoff,x.agent,x.model,x.budget,x.folds)
     else:
         with closing(sqlite3.connect(Path(x.db).resolve().as_uri()+'?mode=ro',uri=True)) as c:
             if x.cmd=='status':
