@@ -88,6 +88,28 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertIn('window_net_deltas',requests[1])
         self.assertNotIn(first['variant']['identity'][:12],requests[0])
 
+    def test_choice_json_mode_retry_and_numeric_string(self):
+        options=[{'control':lab.defaults()[0],'change':'hold'}]
+        replies=[{'message':{'content':''},'done_reason':'length'},
+                 {'message':{'content':'{"choice":"0","reason":"Compare turnover"}'}}]
+        with patch.object(r,'request',side_effect=replies) as call:
+            selected,reason=r.choose('qwen3:4b','alpha',options,{})
+        self.assertIs(selected,options[0]); self.assertEqual(reason,'Compare turnover')
+        self.assertEqual(call.call_args_list[1].args[1]['format'],'json')
+
+    def test_choice_only_retry_is_explicit(self):
+        options=[{'control':lab.defaults()[0],'change':'hold'}]
+        with patch.object(r,'request',return_value={'message':{'content':'{"choice":0}'}}) as call:
+            selected,reason=r.choose('qwen3:4b','alpha',options,{})
+        self.assertIs(selected,options[0]); self.assertIn('no rationale',reason)
+        self.assertEqual(call.call_count,3)
+
+    def test_choice_failure_reports_diagnostics(self):
+        options=[{'control':lab.defaults()[0],'change':'hold'}]
+        with patch.object(r,'request',return_value={'message':{'content':''},'done_reason':'length','eval_count':2048}):
+            with self.assertRaisesRegex(ValueError,'done_reason=length; eval_count=2048'):
+                r.choose('qwen3:4b','alpha',options,{})
+
     def test_interrupt_is_recorded(self):
         original=lab.evaluate
         count=0

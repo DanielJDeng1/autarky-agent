@@ -140,19 +140,39 @@ def memory(c, dataset, folds):
 def choose(model, agent, options, evidence):
     if not model:
         return options[0], 'Deterministic control: investigate the first untested revision.'
-    schema={'type':'object','properties':{'choice':{'type':'integer','enum':list(range(len(options)))},'reason':{'type':'string'}},'required':['choice','reason'],'additionalProperties':False}
+    # Keep the grammar simple for small models; validate the menu index locally.
+    schema={'type':'object','properties':{'choice':{'type':'integer','minimum':0,'maximum':len(options)-1},'reason':{'type':'string','maxLength':240}},'required':['choice','reason'],'additionalProperties':False}
     menu=[{'choice':i,'change':x['change'],'control':x['control'].identity[:12]} for i,x in enumerate(options)]
-    payload={'model':model,'stream':False,'think':False,'format':schema,'options':{'temperature':.2,'num_predict':1024,'num_ctx':8192},'messages':[{'role':'user','content':
-        'You are '+agent+', directing development-only trading research. Choose one matched experiment from the menu based on measured evidence. Prefer cost efficiency, activity, stressed returns and risk; no profit claims. Do not invent evidence or change allocation. State a falsifiable reason. Evidence: '+json.dumps(evidence,separators=(',',':'))+' Menu: '+json.dumps(menu,separators=(',',':'))}]}
-    for _ in range(2):
+    context='You are '+agent+', directing development-only trading research. Choose one matched experiment from the menu based on measured evidence. Prefer cost efficiency, activity, stressed returns and risk; no profit claims. Do not invent evidence or change allocation. Evidence: '+json.dumps(evidence,separators=(',',':'))+' Menu: '+json.dumps(menu,separators=(',',':'))
+    instruction=' Return ONLY a JSON object with choice (zero-based integer menu index) and reason (one short falsifiable sentence, at most 240 characters). Example: {"choice":0,"reason":"Test whether this revision reduces turnover."}'
+    errors=[]
+    for attempt in range(3):
+        # Retry with JSON mode rather than the same schema; last attempt only needs a valid choice.
+        prompt=context+instruction if attempt<2 else context+' Return ONLY JSON with the chosen zero-based integer index, e.g. {"choice":0}. No explanation needed.'
+        payload={'model':model,'stream':False,'think':False,'format':schema if attempt==0 else 'json','options':{'temperature':0,'num_predict':2048 if attempt==0 else 4096,'num_ctx':8192},'messages':[{'role':'user','content':prompt}]}
+        response=None; raw=None
         try:
-            obj=json.loads(request('http://127.0.0.1:11434/api/chat',payload)['message']['content'])
-            if type(obj['choice']) is not int or not 0<=obj['choice']<len(options) or not isinstance(obj['reason'],str) or not 1<=len(obj['reason'])<=500:
-                raise ValueError('Invalid choice')
-            return options[obj['choice']],obj['reason']
-        except (ValueError,TypeError,KeyError):
-            continue
-    raise ValueError('Ollama did not return a valid experiment choice')
+            response=request('http://127.0.0.1:11434/api/chat',payload)
+            raw=response['message']['content']
+            if not isinstance(raw,str): raise ValueError('message.content is not text')
+            body=raw.strip()
+            if body.startswith('```') and body.endswith('```'):
+                body=body[3:-3].strip()
+                if body.startswith('json'): body=body[4:].strip()
+            obj=json.loads(body)
+            if not isinstance(obj,dict): raise ValueError('expected a JSON object')
+            index=obj.get('choice')
+            if isinstance(index,str) and index.isascii() and index.isdecimal(): index=int(index)
+            if type(index) is not int or not 0<=index<len(options): raise ValueError('choice is not a valid menu index')
+            reason=obj.get('reason')
+            if not isinstance(reason,str) or not reason.strip():
+                if attempt<2: raise ValueError('missing reason')
+                reason='Model selected this experiment; no rationale returned (choice-only retry).'
+            return options[index],reason.strip()[:500]
+        except (ValueError,TypeError,KeyError) as exc:
+            meta=response if isinstance(response,dict) else {}
+            errors.append(f'attempt {attempt+1}: {exc}; done_reason={meta.get("done_reason")}; eval_count={meta.get("eval_count")}; content={repr(raw)[:300]}')
+    raise ValueError('Ollama did not return a valid experiment choice: '+' | '.join(errors))
 
 
 def session(path,bars,pair,cutoff,agent,model=None,budget=5,folds=6):
