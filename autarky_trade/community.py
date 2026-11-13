@@ -11,6 +11,7 @@ import time
 
 from .signals import filter_schema
 from .research import assess
+from . import paper_audit
 from .core import Account, Costs, Strategy, backtest, kraken, quote, load_csv, synthetic, validate, request
 
 AGENTS = {'alpha': 'trend', 'beta': 'reversion', 'gamma': 'breakout'}
@@ -171,6 +172,9 @@ def tick(path, bars, bid, ask, now=None):
         c.execute('BEGIN IMMEDIATE'); t=c.execute('SELECT * FROM treasury').fetchone()
         if ts<t['last_ts']:
             return {'status':'already processed','ts':ts}
+        paper_audit.setup(c)
+        quote_id=paper_audit.record_quote(c,ts,now,bid,ask)
+        if quote_id is None: return {'status':'older quote ignored','ts':ts}
         if ts==t['last_ts']:
             # Quotes can move sharply between candle closes. Revalue and enforce risk,
             # but never execute a new strategy entry or count another observation.
@@ -181,14 +185,14 @@ def tick(path, bars, bid, ask, now=None):
             changed=False
             for name,a in states.items():
                 before=a.trades; a.mark(bid)
-                if stopped or a.stopped: a.fill(False,bid,ask,COSTS); a.mark(bid)
+                if stopped or a.stopped: paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'portfolio_stop' if stopped else 'agent_stop'); a.mark(bid)
                 changed=changed or a.trades!=before
                 c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
             equity=t['reserve']+sum(a.equity(bid) for a in states.values())
             if equity<=peak*(1-MAX_DRAWDOWN) and not stopped:
                 stopped=True
                 for name,a in states.items():
-                    before=a.trades; a.fill(False,bid,ask,COSTS); a.mark(bid)
+                    before=a.trades; paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'portfolio_stop'); a.mark(bid)
                     changed=changed or a.trades!=before
                     c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
             c.execute('UPDATE treasury SET last_bid=?,peak=?,stopped=?',(bid,peak,int(stopped)))
@@ -210,8 +214,8 @@ def tick(path, bars, bid, ask, now=None):
                 active_since=ts; active_fills=0; active_ticks=0; active_start_nav=a.cash/r['shares']
             # If candidate is pending, unwind existing strategy before switching; no overlapping positions.
             signal=bool(active and ts>after and not (pending and ts>pa) and not stopped and not a.stopped and Strategy(**json.loads(active)).signal([b.close for b in bars]))
-            before=a.trades; a.fill(signal,bid,ask,COSTS); a.mark(bid)
-            if a.stopped: a.fill(False,bid,ask,COSTS); a.mark(bid); signal=False
+            before=a.trades; paper_audit.fill(c,quote_id,name,a,signal,bid,ask,COSTS,'portfolio_stop' if stopped else 'agent_stop' if a.stopped else 'strategy_switch' if pending and ts>pa else 'strategy_signal'); a.mark(bid)
+            if a.stopped: paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'agent_stop'); a.mark(bid); signal=False
             active_fills+=a.trades-before
             active_ticks+=int(bool(active))
             details[name]={'equity':a.equity(bid),'signal':signal,'fills':a.trades-before,'active':json.loads(active) if active else None}
@@ -221,7 +225,7 @@ def tick(path, bars, bid, ask, now=None):
         if equity<=peak*(1-MAX_DRAWDOWN) or stopped:
             stopped=True
             for name,a in states.items():
-                before=a.trades; a.fill(False,bid,ask,COSTS); a.mark(bid)
+                before=a.trades; paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'portfolio_stop'); a.mark(bid)
                 details[name].update(equity=a.equity(bid),signal=False,fills=details[name]['fills']+a.trades-before)
                 c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
             equity=t['reserve']+sum(a.equity(bid) for a in states.values())
@@ -260,6 +264,7 @@ def rebalance(path, now=None):
 
 def status(path):
     with db(path) as c:
+        c.execute('BEGIN')
         t=dict(c.execute('SELECT * FROM treasury').fetchone()); agents=[]
         for r in c.execute('SELECT * FROM agents ORDER BY id'):
             a=Account(**json.loads(r['account'])); equity=a.equity(t['last_bid'] or 0)
@@ -274,7 +279,7 @@ def main():
     r=sub.add_parser('research'); r.add_argument('--source',choices=['synthetic','csv','kraken'],default='kraken'); r.add_argument('--csv'); r.add_argument('--model')
     d=sub.add_parser('run'); d.add_argument('--model'); d.add_argument('--poll',type=int,default=60); d.add_argument('--research-hours',type=int,default=24); d.add_argument('--once',action='store_true'); d.add_argument('--paper-only',action='store_true')
     rl=sub.add_parser('research-loop'); rl.add_argument('--model'); rl.add_argument('--hours',type=int,default=24); rl.add_argument('--once',action='store_true')
-    sub.add_parser('status'); sub.add_parser('rebalance'); sub.add_parser('history'); sub.add_parser('trials'); sub.add_parser('stop'); sub.add_parser('readiness')
+    sub.add_parser('status'); sub.add_parser('rebalance'); sub.add_parser('history'); sub.add_parser('trials'); sub.add_parser('stop'); sub.add_parser('readiness'); j=sub.add_parser('journal'); j.add_argument('--limit',type=int,default=30)
     x=p.parse_args()
     def out(v): print(json.dumps(v,indent=2,allow_nan=False),flush=True)
     if x.cmd=='init': init(x.db,x.pair,x.interval,x.capital); out(status(x.db)); return
@@ -285,6 +290,7 @@ def main():
             c.execute('BEGIN IMMEDIATE'); c.execute('UPDATE treasury SET stopped=1'); event(c,'operator_stop',{'note':'Paper positions will flatten at next fresh quote'}); c.commit()
         out({'status':'stopped; run paper loop to flatten'}); return
     if x.cmd=='readiness': out(readiness(x.db)); return
+    if x.cmd=='journal': out(paper_audit.report(x.db,x.limit)); return
     if x.cmd=='trials':
         with db(x.db) as c: out([{'round':r['round_id'],'agent':r['agent'],'report':json.loads(r['report'])} for r in c.execute('SELECT * FROM trials ORDER BY round_id DESC,agent LIMIT 30')]); return
     if x.cmd=='history':

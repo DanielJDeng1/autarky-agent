@@ -23,9 +23,14 @@ Scope: v0.4 research, strategy identity, queued experiments, simulation, allocat
 | Medium | Portfolio concentration in one market and correlated agents; reserve only grows via unused funds and allocation is one-way. | Multi-market exposure and portfolio risk budget; evaluate retirement/reallocation policies rather than reward raw return. |
 | Medium | Older v0.2 legacy CLI remains separate and has weaker research gates. | Keep for reproducibility only; do not use it for promotion or real trading. |
 | Medium | Imported CSV provenance is operator-asserted, archived gaps truncate usable history, and exact overlapping candle differences require investigation. | Preserve source manifests and dataset lineage; reconcile vendor precision without silently changing evaluated data. |
-| Medium | Dashboard reads across multiple transactions; intrabar exit accounting is in events, not candle history. | Add consistent portfolio snapshots and an order/fill journal for exact execution audit. |
+| Medium | Dashboard combines multiple queries; historical journal coverage starts at upgrade. | Paper quote/fill journal and consistent account-status snapshot implemented; dashboard-wide snapshot and independent exchange reconciliation remain open. |
 | Medium | Long-running jobs can exceed leases; current retry freezes plans but has no heartbeat. | Add renewal with bounded inference and watchdog; run one model at a time on constrained GPU. |
 
 ## Deployment acceptance
 
 Use a stopped/backed-up database when upgrading. Existing legacy active paper strategies are not retroactively validated by the new protocol; use a new database for a clean research experiment. Verify tests, local Ollama, Kraken public data, and a sustained paper trial. No live adapter exists. Do not infer actual profitability from synthetic tests or readiness gates. No real orders have been placed.
+
+
+## Follow-up: execution audit
+
+The paper execution journal is append-only through application code and records quotes, simulated fills, before/after balances, fees and reasons in the same transaction as the account mutation. Reconciliation is against a documented upgrade baseline, including capital transfers. Stale observed timestamps cannot replace newer account valuations. Five additional regression tests cover fills and fees, stale/duplicate quotes, legacy baselines and accounting discrepancies. The journal is not tamper-proof and is not an exchange ledger. No live orders or credentials are introduced.

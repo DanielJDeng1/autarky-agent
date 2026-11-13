@@ -173,3 +173,12 @@ If a remote already contains commits, do not force-push or overwrite it. Clone i
 ## 8. Scope and verification
 
 The local code and unit tests were exercised with offline fixtures and mocked data, including job leases, idempotency, budget conservation, data segregation, cost modeling, strategy activation and portfolio stops. Live Kraken and Ollama availability on your machine, sustained performance, and exchange execution are not verified. The agents are independent research workers with distinct portfolios, not self-modifying general-purpose agents; the founder implements deterministic allocation rules. The ultimate Conway-style goal is a population that learns and trades independently and pays its operating costs from real measured profits. This release does not demonstrate profitability or economic self-sufficiency.
+
+
+### Paper execution audit journal (v0.5)
+
+```sh
+python -m autarky_trade.community journal --limit 30
+```
+
+The journal records accepted simulated quotes and fills atomically with account changes. It includes side, quantity, execution price, fee, reason, and before/after cash and units. Its reconciliation checks cash, units, fees and fill counts against account balances, accounting separately for funding transfers. Existing databases receive an explicit starting baseline; earlier fills are not fabricated. Older observed quotes are ignored. These are simulated executions, not exchange confirmations or an independently authenticated ledger.
