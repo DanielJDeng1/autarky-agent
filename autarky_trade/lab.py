@@ -232,15 +232,15 @@ def defaults():
 def propose(model,bars):
     """Only development data, typed executable rules; no prose-to-code interpretation."""
     rule={'type':'object','properties':{'feature':{'type':'string','enum':[f for f in FEATURES if f!='forecast']},'window':{'type':'integer','minimum':2,'maximum':720},'op':{'type':'string','enum':['gt','lt']},'threshold':{'type':'number'}},'required':['feature','window','op','threshold'],'additionalProperties':False}
-    props={'name':{'type':'string'},'entry':{'type':'array','minItems':1,'maxItems':4,'items':rule},'exit':{'type':'array','minItems':1,'maxItems':4,'items':rule},'min_hold':{'type':'integer'},'cooldown':{'type':'integer'},'max_hold':{'type':'integer'},'fraction':{'type':'number'},'hypothesis':{'type':'string'}}
+    props={'name':{'type':'string'},'entry':{'type':'array','minItems':1,'maxItems':4,'items':rule},'exit':{'type':'array','minItems':1,'maxItems':4,'items':rule},'min_hold':{'type':'integer'},'cooldown':{'type':'integer'},'max_hold':{'type':'integer'},'fraction':{'type':'number','enum':[0.25]},'hypothesis':{'type':'string'}}
     schema={'type':'object','properties':{'policies':{'type':'array','minItems':1,'maxItems':4,'items':{'type':'object','properties':props,'required':list(props),'additionalProperties':False}}},'required':['policies'],'additionalProperties':False}
     summary={'bars':len(bars),'first':bars[0].ts,'last':bars[-1].ts,'return':bars[-1].close/bars[0].close-1,'hourly_volatility':Features(bars).series('volatility',168)[-1]}
-    payload={'model':model,'stream':False,'think':False,'format':schema,'messages':[{'role':'user','content':f'Design 1-4 long-only hourly BTC/ETH development policies. Entry ALL and exit ANY; only explicit rules execute. Momentum fractional return; distance close/SMA-1; volatility standard deviation of hourly returns; RSI 0-100; volume_ratio last volume/prior mean; breakout last close/prior maximum high-1. Windows 2..720, min_hold < max_hold <=720, cooldown 0..720, fraction .01..25 (maximum .25). Prefer multi-day hypotheses and account for 1.2% approximate round-trip friction. State falsifiable rationale matching rules, no profit claims. Development summary: {encode(summary)}'}],'options':{'temperature':.3,'num_predict':4096}}
+    payload={'model':model,'stream':False,'think':False,'format':schema,'messages':[{'role':'user','content':f'Design 1-4 long-only hourly BTC/ETH development policies. Entry ALL and exit ANY; only explicit rules execute. Momentum fractional return; distance close/SMA-1; volatility standard deviation of hourly returns; RSI 0-100; volume_ratio last volume/prior mean; breakout last close/prior maximum high-1. Windows 2..720, min_hold < max_hold <=720, cooldown 0..720, fraction exactly 0.25 for matched comparisons. Prefer multi-day hypotheses and account for 1.2% approximate round-trip friction. State falsifiable rationale matching rules, no profit claims. Development summary: {encode(summary)}'}],'options':{'temperature':.3,'num_predict':4096}}
     for _ in range(2):
         try:
             obj=json.loads(request('http://127.0.0.1:11434/api/chat',payload)['message']['content'])
             if not isinstance(obj['policies'],list) or not 1<=len(obj['policies'])<=4: raise ValueError('Invalid policy count')
-            return [Policy(**p) for p in obj['policies']]
+            return [Policy(**dict(p, fraction=.25)) for p in obj['policies']]
         except (ValueError,KeyError,TypeError): continue
     raise ValueError('Ollama did not return valid executable policies')
 
@@ -275,7 +275,7 @@ def history(source,cutoff):
     return pair,validate(list(reversed(bars)),3600)
 
 
-def run(path,bars,pair,cutoff,policies,model=None,folds=6,now=None):
+def evaluate(bars,pair,cutoff,policies,model=None,folds=6,now=None):
     """Reusable development folds, isolated from all promotion/final ledgers."""
     now=int(time.time()) if now is None else now
     if pair not in ('XBTUSD','ETHUSD') or type(cutoff) is not int or type(folds) is not int or not 3<=folds<=12: raise ValueError('Invalid lab configuration')
@@ -322,6 +322,13 @@ def run(path,bars,pair,cutoff,policies,model=None,folds=6,now=None):
                 'fills_delta':variant['fills']-base['fills'],
                 'note':'Matched development ablation, not independent evidence.'})
     report={'protocol':PROTOCOL,'dataset_sha256':key,'pair':pair,'cutoff':cutoff,'first':bars[0].ts,'last':bars[-1].ts,'bars':len(bars),'folds':folds,'model':model,'development_only':True,'eligible':False,'comparisons':comparisons,'results':results}
+    return report
+
+
+def run(path,bars,pair,cutoff,policies,model=None,folds=6,now=None):
+    now=int(time.time()) if now is None else now
+    report=evaluate(bars,pair,cutoff,policies,model,folds,now)
+    key=report['dataset_sha256']
     Path(path).parent.mkdir(parents=True,exist_ok=True)
     with closing(sqlite3.connect(path,timeout=30)) as c,c:
         tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
