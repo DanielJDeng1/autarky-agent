@@ -4,6 +4,35 @@
 
 Conway-inspired economic selection for a population of trading research agents. Alpha researches trends, Beta mean reversion, Gamma breakouts. Each can run in its own process, maintains persistent research and paper-account state, and receives resources according to observed performance. The local model proposes bounded strategy parameters; deterministic code performs all calculations and trading decisions. No paid AI API is required. This is experimental quantitative research software, not a profitable trading system or a financial recommendation.
 
+## v0.4 — quantitative research expansion
+
+This release remains **paper-only**. Existing v0.3 SQLite databases remain compatible. Old strategy JSON lacking `filters` is interpreted as an empty list; unchanged strategies retain their performance records.
+
+- The local model proposes up to three AND-combined close-price filters on each agent's base rule: momentum (fractional return), distance from SMA, return volatility, and simple-window RSI. All fields and thresholds are validated. No generated Python or shell code runs. Deterministic defaults now include two filtered variants per agent.
+- The selected candidate is compared against cash, an allocation-matched buy-and-hold reference, and 31 seeded random-timing paths calibrated on training signal occupancy and turnover. Approval additionally requires beating the random 75th percentile. These are descriptive comparisons, not significance tests; legacy trial reports retain their original gates.
+- Synchronous research consumes its holdout before evaluation, like the job queue. A failed inference or crash can burn an interval without a result; this prevents inadvertent holdout reuse.
+- The SQLite market archive retains closed candles across sessions. Research uses the latest contiguous suffix, capped at 20,000 candles. Exact duplicates are ignored, conflicting overlapping bars abort ingestion, and gaps are never interpolated. A CSV is operator-supplied: verify its pair, provenance, and time interval.
+
+```bash
+python -m autarky_trade.community init
+python -m autarky_trade.archive import path/to/XBTUSD_60.csv
+python -m autarky_trade.archive sync
+python -m autarky_trade.archive status
+python -m autarky_trade.jobs coordinate --loop --poll 300
+```
+
+Importing a CSV is optional but recommended for long-history research; synchronization pulls the recent Kraken window and appends it. If overlapping historical and exchange candles disagree, investigate the source instead of overwriting used history. The archive belongs to the database's configured market and interval.
+
+Start the three research workers and paper trader as documented below. Open a separate terminal for the new read-only monitor:
+
+```bash
+python -m autarky_trade.dashboard
+```
+
+Visit http://127.0.0.1:8765 to inspect paper equity, agent portfolios, archive coverage, latest trial benchmarks, readiness, and recent events. The dashboard serves a JSON view at `/api/status`, refreshes every 30 seconds, and binds only to localhost. Do not expose it publicly. Supply `--db` before the subcommand in archive/community/jobs, or before `--port` for dashboard, to select a different database.
+
+The research language is deliberately bounded. Arbitrary strategy-code generation, ML model training, multiple markets per portfolio, real exchange execution, and proven profitability are not implemented. The next milestone is richer independent experiments and an isolated, auditable execution service, with real trading gated on forward evidence and operator approval.
+
 ## 1. Quick start (Windows PowerShell, macOS, Linux)
 
 Extract this repository and open a terminal in its root. Python 3.11 or later is sufficient; there are no third-party Python dependencies. On Windows, substitute `py -3` for `python` if necessary.
