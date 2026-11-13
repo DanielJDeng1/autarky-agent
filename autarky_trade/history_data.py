@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import subprocess
+import urllib.error
 import urllib.request
 import zipfile
 from .core import Bar, validate
@@ -30,8 +32,23 @@ def fetch(url, path, expected=None):
     if path.exists() and expected and sha256(path) == expected:
         return
     temp = path.with_name(path.name + '.partial')
-    with urllib.request.urlopen(url, timeout=120) as response, open(temp, 'wb') as f:
-        shutil.copyfileobj(response, f, 1024*1024)
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Autarky-history/0.13'})
+        with urllib.request.urlopen(req, timeout=120) as response, open(temp, 'wb') as f:
+            shutil.copyfileobj(response, f, 1024*1024)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 403:
+            raise
+        # Kraken documents curl for these public static archive downloads.
+        curl = shutil.which('curl.exe') or shutil.which('curl')
+        if not curl:
+            raise
+        result = subprocess.run([curl, '--fail', '--location', '--retry', '2',
+                                 '--connect-timeout', '30', '--output', str(temp), url],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if result.returncode:
+            raise urllib.error.HTTPError(url, 403, 'Python download refused; curl also failed: ' +
+                                         result.stderr[-500:], exc.headers, None) from exc
     if expected and sha256(temp) != expected:
         raise ValueError(f'Checksum mismatch: {path.name}; partial retained')
     os.replace(temp, path)
@@ -60,17 +77,27 @@ def acquire(root):
     if archive.exists() and sha256(archive) == FULL_SHA:
         return archive
     manifest = root / CHECKSUMS
-    fetch(BASE + CHECKSUMS, manifest)
-    hashes = checksums(manifest.read_text(encoding='utf-8'))
+    try:
+        fetch(BASE + CHECKSUMS, manifest)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (403, 404):
+            raise
+        # The manifest is optional per Kraken. The pinned full hash remains mandatory.
+        import sys
+        print('Part checksum manifest unavailable; verifying the assembled ZIP against the published SHA-256.', file=sys.stderr)
+    hashes = checksums(manifest.read_text(encoding='utf-8')) if manifest.exists() else {}
     for name in PARTS:
-        fetch(BASE + name, root / name, hashes[name])
+        part = root / name
+        if not hashes and part.exists():
+            continue  # Previously downloaded part; full archive hash still must pass.
+        fetch(BASE + name, part, hashes.get(name))
     temp = archive.with_suffix('.partial')
     with open(temp, 'wb') as out:
         for name in PARTS:
             with open(root / name, 'rb') as f:
                 shutil.copyfileobj(f, out, 1024*1024)
     if sha256(temp) != FULL_SHA:
-        raise ValueError('Assembled archive differs from pinned published checksum; review release')
+        raise ValueError('Assembled archive differs from pinned published checksum; review Kraken release or redownload archive parts')
     os.replace(temp, archive)
     return archive
 

@@ -32,6 +32,33 @@ class V13(unittest.TestCase):
         with patch.object(h.urllib.request,'urlopen',return_value=io.BytesIO(b'wrong')):
             with self.assertRaisesRegex(ValueError,'Checksum mismatch'): h.fetch('https://example.com',p,'a'*64)
         self.assertEqual(p.read_bytes(),b'old')
+    def test_curl_fallback_checks_download(self):
+        import hashlib
+        import urllib.error
+        from types import SimpleNamespace
+        p=self.root/'data'
+        def curl(args, **kwargs):
+            Path(args[args.index('--output')+1]).write_bytes(b'good')
+            return SimpleNamespace(returncode=0,stderr='')
+        with patch.object(h.urllib.request,'urlopen',side_effect=urllib.error.HTTPError('https://example.com',403,'Forbidden',None,None)), patch.object(h.shutil,'which',return_value='curl'), patch.object(h.subprocess,'run',side_effect=curl):
+            h.fetch('https://example.com',p,hashlib.sha256(b'good').hexdigest())
+        self.assertEqual(p.read_bytes(),b'good')
+    def test_manifest_unavailable_full_checksum_required(self):
+        import hashlib
+        import urllib.error
+        parts=[b'one',b'two',b'three',b'four',b'five']
+        def download(url,path,expected=None):
+            if url.endswith(h.CHECKSUMS):
+                raise urllib.error.HTTPError(url,403,'Forbidden',None,None)
+            self.assertIsNone(expected)
+            path.write_bytes(parts[h.PARTS.index(path.name)])
+        with patch.object(h,'fetch',side_effect=download), patch.object(h,'FULL_SHA',hashlib.sha256(b''.join(parts)).hexdigest()):
+            self.assertEqual(h.acquire(self.root).read_bytes(),b''.join(parts))
+        (self.root/'Kraken_OHLCVT_Full.zip').unlink()
+        (self.root/h.PARTS[0]).write_bytes(b'corrupt')
+        with patch.object(h,'fetch',side_effect=download), patch.object(h,'FULL_SHA',hashlib.sha256(b''.join(parts)).hexdigest()):
+            with self.assertRaisesRegex(ValueError,'published checksum'): h.acquire(self.root)
+        self.assertFalse((self.root/'Kraken_OHLCVT_Full.zip').exists())
     def test_no_trade_menu_changes_only_entry(self):
         p=next(x for x in lab.defaults() if x.name=='reversion-recovery')
         metrics={'fills':0}; opts=a.ranked_variants(p,metrics,self.bars,[])
