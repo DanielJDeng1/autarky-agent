@@ -7,7 +7,7 @@ import sqlite3
 import time
 import uuid
 
-from . import community as m
+from . import community as m, archive
 from .core import Bar, kraken, load_csv, validate
 
 LEASE = 600
@@ -97,7 +97,7 @@ def finalize(path, now=None):
             report=json.loads(r['report']); a=r['agent']; c.execute('INSERT INTO trials VALUES(?,?,?)',(rid,a,r['report']))
             if report['eligible']:
                 agent=c.execute('SELECT active,pending FROM agents WHERE id=?',(a,)).fetchone(); s=m.encode(report['strategy'])
-                if s not in (agent['active'],agent['pending']): c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(s,b['test_end'],a))
+                if not any(m.same_strategy(s,old) for old in (agent['active'],agent['pending'])): c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(s,b['test_end'],a))
         c.execute("UPDATE batches SET state='done' WHERE id=?",(b['id'],)); m.event(c,'batch_finalized',{'batch':b['id'],'round':rid}); c.commit(); return {'status':'finalized','batch':b['id'],'round':rid}
 
 
@@ -111,14 +111,18 @@ def main():
     def out(r): print(json.dumps(r,indent=2),flush=True)
     if x.cmd=='status':
         with m.db(x.db) as c: out([dict(r) for r in c.execute('SELECT batch_id,agent,state,attempts,error FROM jobs ORDER BY batch_id DESC,agent LIMIT 60')]); return
-    if x.cmd=='schedule': out(schedule(x.db,load_csv(x.csv,cfg['interval']*60) if x.csv else kraken(cfg['pair'],cfg['interval']),'csv' if x.csv else 'kraken')); return
+    if x.cmd=='schedule':
+        if x.csv:
+            archive.ingest(x.db,load_csv(x.csv,cfg['interval']*60),'csv'); bars=archive.latest(x.db)
+        else: bars=archive.sync(x.db)
+        out(schedule(x.db,bars,'csv' if x.csv else 'kraken')); return
     if x.poll<5: p.error('poll >=5 seconds')
     while True:
         try:
             if x.cmd=='worker': out(work(x.db,x.agent,x.model))
             else:
                 out(finalize(x.db))
-                if not m.status(x.db)['stopped']: out(schedule(x.db,kraken(cfg['pair'],cfg['interval']),'kraken'))
+                if not m.status(x.db)['stopped']: out(schedule(x.db,archive.sync(x.db),'kraken'))
         except (OSError,ValueError,RuntimeError,sqlite3.Error) as exc:
             out({'status':'cycle skipped','error':str(exc)})
             if not x.loop: raise

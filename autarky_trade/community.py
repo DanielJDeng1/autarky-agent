@@ -9,6 +9,8 @@ from pathlib import Path
 import sqlite3
 import time
 
+from .signals import filter_schema
+from .benchmarks import reference
 from .core import Account, Costs, Strategy, backtest, kraken, quote, load_csv, synthetic, validate, request
 
 AGENTS = {'alpha': 'trend', 'beta': 'reversion', 'gamma': 'breakout'}
@@ -76,18 +78,27 @@ def config(path):
 def candidates(family, model, training, agent, prior):
     # Agents have disjoint strategy families; prior reports contain training/validation only.
     defaults=[Strategy(family,f,s,f'{agent}-{f}-{s}') for f,s in [(5,20),(12,48),(8,35),(20,80)]]
+    # Diverse deterministic baselines remain available without a model.
+    defaults[2]=Strategy(family,8,35,f'{agent}-8-35-filtered',({'feature':'volatility','window':20,'op':'lt','threshold':.03},))
+    defaults[3]=Strategy(family,20,80,f'{agent}-20-80-filtered',({'feature':'momentum','window':12,'op':'gt','threshold':-.01},))
     if not model: return defaults
     returns=[b.close/a.close-1 for a,b in zip(training,training[1:])]
     summary={'n':len(training),'return':training[-1].close/training[0].close-1,'mean':sum(returns)/len(returns),'volatility':math.sqrt(sum(x*x for x in returns)/len(returns)),'prior_training_validation':prior}
-    schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'}},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
-    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five hypotheses with 2 <= fast < slow <= 100. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
+    schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'},'filters':filter_schema()},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
+    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five hypotheses with 2 <= fast < slow <= 100. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
     proposed=json.loads(r['message']['content'])['strategies']
     for x in proposed[:5]:
         try:
-            s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}')
-            if s not in defaults: defaults.append(s)
+            s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}',x.get('filters',()))
+            if not any((s.fast,s.slow,s.filters)==(d.fast,d.slow,d.filters) for d in defaults): defaults.append(s)
         except (KeyError,TypeError,ValueError): continue
     return defaults
+
+
+def same_strategy(left, right):
+    if not left or not right: return False
+    a,b=Strategy(**json.loads(left)),Strategy(**json.loads(right))
+    return (a.kind,a.fast,a.slow,a.filters)==(b.kind,b.fast,b.slow,b.filters)
 
 
 def research(path, bars, source, model=None, now=None):
@@ -105,23 +116,31 @@ def research(path, bars, source, model=None, now=None):
     if len(bars)-hold<MIN_TEST: return {'status':'waiting for new unseen data','new_test_bars':len(bars)-hold,'required':MIN_TEST}
     train_end=int(hold*.75)
     with db(path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        current=c.execute('SELECT last_holdout,stopped FROM treasury').fetchone()
+        if current['stopped']: return {'status':'stopped'}
+        if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='batches'").fetchone() and c.execute("SELECT id FROM batches WHERE state='open'").fetchone(): raise ValueError('Queued research batch open; finalize it first')
+        if current['last_holdout']!=cfg['last_holdout']: raise ValueError('Research state changed; retry with fresh data')
         prior={}
         for a in AGENTS:
             row=c.execute('SELECT report FROM trials WHERE agent=? ORDER BY round_id DESC LIMIT 1',(a,)).fetchone()
             prior[a]=json.loads(row[0])['candidates'][:3] if row else []
+        # Consume the holdout before evaluation, even if inference or a later write fails.
+        c.execute('UPDATE treasury SET last_holdout=?',(end,))
+        event(c,'holdout_reserved',{'start':bars[hold].ts,'end':end,'source':source}); c.commit()
     reports={a:assess(bars,candidates(f,model,bars[:train_end],a,prior[a]),hold) for a,f in AGENTS.items()}
     with db(path) as c:
         c.execute('BEGIN IMMEDIATE')
-        current=c.execute('SELECT last_holdout FROM treasury').fetchone()[0]
-        if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='batches'").fetchone() and c.execute("SELECT id FROM batches WHERE state='open'").fetchone(): raise ValueError('Queued research batch open; finalize it first')
-        if current!=cfg['last_holdout']: raise ValueError('Research state changed; retry with fresh data')
+        current=c.execute('SELECT last_holdout,stopped FROM treasury').fetchone()
+        if current['last_holdout']!=end or current['stopped']:
+            raise ValueError('Research superseded or stopped; holdout remains consumed')
         rid=c.execute('INSERT INTO rounds(created,source,test_start,test_end,observations) VALUES(?,?,?,?,?)',(now,source,bars[hold].ts,end,len(bars))).lastrowid
         for a,r in reports.items():
             c.execute('INSERT INTO trials VALUES(?,?,?)',(rid,a,encode(r)))
             if r['eligible']:
                 current_agent=c.execute('SELECT active,pending FROM agents WHERE id=?',(a,)).fetchone()
                 proposed=encode(r['strategy'])
-                if proposed not in (current_agent['active'],current_agent['pending']):
+                if not any(same_strategy(proposed,old) for old in (current_agent['active'],current_agent['pending'])):
                     c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(proposed,end,a))
         c.execute('UPDATE treasury SET last_holdout=?',(end,))
         event(c,'research',{'round':rid,'source':source,'model':model,'eligible':[a for a,r in reports.items() if r['eligible']]})
@@ -139,7 +158,9 @@ def assess(bars, strategies, hold):
     winner=rows[0]; s=Strategy(**winner['strategy'])
     test=backtest(bars,s,COSTS,hold,n); stress=backtest(bars,s,Costs(80,20),hold,n)
     eligible=all(r['return']>0 and r['trades']>=4 and r['drawdown']<MAX_DRAWDOWN and not r['stopped'] for r in (winner['train'],winner['validation'],test,stress))
-    return {'strategy':asdict(s),'candidates':rows,'test':test,'stress':stress,'eligible':eligible,'note':'Exploratory gate; three simultaneous hypotheses, not proof of statistical edge.'}
+    benchmarks=reference(bars,s,COSTS,hold,n,split)
+    eligible=eligible and test['return']>benchmarks['random_p75']
+    return {'strategy':asdict(s),'candidates':rows,'test':test,'stress':stress,'benchmarks':benchmarks,'eligible':eligible,'note':'Exploratory gate; random benchmark is descriptive, not a significance test.'}
 
 
 def tick(path, bars, bid, ask, now=None):
@@ -255,17 +276,20 @@ def main():
     if x.cmd=='history':
         with db(x.db) as c: out([dict(r) for r in c.execute('SELECT * FROM events ORDER BY id DESC LIMIT 100')]); return
     cfg=config(x.db)
+    from . import archive
     if x.cmd=='research':
         if x.source=='csv' and not x.csv: p.error('--csv required')
         if x.source=='synthetic' and cfg['interval']!=60: p.error('synthetic uses hourly bars')
         bars=synthetic() if x.source=='synthetic' else load_csv(x.csv,cfg['interval']*60) if x.source=='csv' else kraken(cfg['pair'],cfg['interval'])
+        if x.source!='synthetic':
+            archive.ingest(x.db,bars,x.source); bars=archive.latest(x.db)
         out(research(x.db,bars,x.source,x.model)); return
     if x.cmd=='research-loop':
         if x.hours<1: p.error('hours must be >=1')
         while True:
             try:
                 if status(x.db)['stopped']: out({'status':'stopped'}); break
-                out(research(x.db,kraken(cfg['pair'],cfg['interval']),'kraken',x.model))
+                out(research(x.db,archive.sync(x.db),'kraken',x.model))
             except (OSError,ValueError,RuntimeError,KeyError,TypeError,sqlite3.Error) as e:
                 out({'status':'research skipped','error':str(e)})
                 if x.once: raise
@@ -279,7 +303,7 @@ def main():
             bars=kraken(cfg['pair'],cfg['interval']); bid,ask=quote(cfg['pair']); out(tick(x.db,bars,bid,ask)); out(rebalance(x.db))
             if not x.paper_only and time.time()>=next_research and not status(x.db)['stopped']:
                 next_research=time.time()+x.research_hours*3600
-                out(research(x.db,bars,'kraken',x.model))
+                archive.ingest(x.db,bars,'kraken'); out(research(x.db,archive.latest(x.db),'kraken',x.model))
         except (OSError,ValueError,RuntimeError,KeyError,TypeError,sqlite3.Error) as e:
             out({'status':'cycle skipped','error':str(e)})
             if x.once: raise

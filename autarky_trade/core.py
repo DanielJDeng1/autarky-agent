@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv, json, math, urllib.request, urllib.parse, time, random
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from .signals import normalize, passes
 
 @dataclass(frozen=True)
 class Bar:
@@ -18,11 +19,13 @@ class Strategy:
     fast: int
     slow: int
     name: str
+    filters: tuple = ()
     def __post_init__(self):
         if self.kind not in ('trend','breakout','reversion') or type(self.fast) is not int or type(self.slow) is not int or not 2 <= self.fast < self.slow <= 100 or not isinstance(self.name,str) or not 1 <= len(self.name) <= 80:
             raise ValueError('Invalid strategy')
+        object.__setattr__(self, 'filters', normalize(self.filters))
     def signal(self, closes):
-        if len(closes) < self.slow: return False
+        if len(closes) < self.slow or not passes(self.filters, closes): return False
         f=sum(closes[-self.fast:])/self.fast; s=sum(closes[-self.slow:])/self.slow
         if self.kind=='trend': return f>s
         if self.kind=='breakout': return closes[-1]>max(closes[-self.slow:-1])
