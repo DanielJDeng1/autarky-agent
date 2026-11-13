@@ -7,7 +7,7 @@ import sqlite3
 import time
 import uuid
 import threading
-from . import resources
+from . import resources, allocation
 
 from . import community as m, archive
 from .core import Bar, Strategy, kraken, load_csv, validate
@@ -25,8 +25,9 @@ def setup(path):
         ''')
 
 
-def schedule(path, bars, source, now=None):
+def schedule(path, bars, source, now=None, slots=3):
     if source not in ('csv','kraken'): raise ValueError('Only real history can be queued')
+    if type(slots) is not int or not 1<=slots<=len(m.AGENTS): raise ValueError('Invalid research slot count')
     cfg=m.config(path); bars=validate(bars,cfg['interval']*60); now=int(time.time()) if now is None else now
     if len(bars)<m.MIN_HISTORY or bars[-1].ts+cfg['interval']*60>now: raise ValueError('Insufficient or incomplete history')
     setup(path)
@@ -36,11 +37,12 @@ def schedule(path, bars, source, now=None):
         if c.execute("SELECT id FROM batches WHERE state='open'").fetchone(): return {'status':'batch already open'}
         cutoff=next((i for i,b in enumerate(bars) if b.ts>t['last_holdout']),len(bars)); hold=max(int(len(bars)*.8),cutoff)
         if len(bars)-hold<m.MIN_TEST: return {'status':'waiting for fresh data','new_test_bars':len(bars)-hold}
+        chosen, ranking=allocation.choose(c,slots,now)
         bid=c.execute('INSERT INTO batches(created,source,test_start,test_end,hold_index,bars,state) VALUES(?,?,?,?,?,?,?)',(now,source,bars[hold].ts,bars[-1].ts,hold,m.encode([asdict(b) for b in bars]),'open')).lastrowid
-        for a in m.AGENTS: c.execute("INSERT INTO jobs(batch_id,agent,state) VALUES(?,?,'queued')",(bid,a))
+        for row in chosen: c.execute("INSERT INTO jobs(batch_id,agent,state) VALUES(?,?,'queued')",(bid,row['agent']))
         # Burn this holdout before any worker sees it, even if a worker crashes or fails.
-        c.execute('UPDATE treasury SET last_holdout=?',(bars[-1].ts,)); m.event(c,'batch_scheduled',{'batch':bid,'test_end':bars[-1].ts}); c.commit()
-    return {'status':'scheduled','batch':bid,'test_start':bars[hold].ts,'test_end':bars[-1].ts}
+        c.execute('UPDATE treasury SET last_holdout=?',(bars[-1].ts,)); m.event(c,'batch_scheduled',{'batch':bid,'test_end':bars[-1].ts,'slots':slots,'chosen':[r['agent'] for r in chosen],'ranking':ranking}); c.commit()
+    return {'status':'scheduled','batch':bid,'test_start':bars[hold].ts,'test_end':bars[-1].ts,'agents':[r['agent'] for r in chosen]}
 
 
 def claim(path, agent, now=None):
@@ -143,41 +145,62 @@ def finalize(path, now=None):
         b=c.execute("SELECT * FROM batches WHERE state='open' ORDER BY id LIMIT 1").fetchone()
         if not b: c.commit(); return {'status':'no open batch'}
         rows=list(c.execute('SELECT * FROM jobs WHERE batch_id=? ORDER BY agent',(b['id'],)))
-        if any(r['state']=='failed' for r in rows):
-            c.execute("UPDATE batches SET state='failed' WHERE id=?",(b['id'],)); m.event(c,'batch_failed',{'batch':b['id'],'holdout_consumed':True}); c.commit(); return {'status':'failed; holdout consumed','batch':b['id']}
-        if any(r['state']!='done' for r in rows): c.commit(); return {'status':'waiting for workers','jobs':{r['agent']:r['state'] for r in rows}}
+        if any(r['state'] not in ('done','failed') for r in rows):
+            c.commit(); return {'status':'waiting for workers','jobs':{r['agent']:r['state'] for r in rows}}
+        completed=[r for r in rows if r['state']=='done']
+        failed=[r['agent'] for r in rows if r['state']=='failed']
+        if not completed:
+            c.execute("UPDATE batches SET state='failed' WHERE id=?",(b['id'],)); m.event(c,'batch_failed',{'batch':b['id'],'holdout_consumed':True,'failed':failed}); c.commit(); return {'status':'failed; holdout consumed','batch':b['id']}
         rid=c.execute('INSERT INTO rounds(created,source,test_start,test_end,observations) VALUES(?,?,?,?,?)',(now,b['source'],b['test_start'],b['test_end'],len(json.loads(b['bars'])))).lastrowid
-        for r in rows:
+        for r in completed:
             report=json.loads(r['report']); a=r['agent']; c.execute('INSERT INTO trials VALUES(?,?,?)',(rid,a,r['report']))
             from .research import PROTOCOL
             stopped=c.execute('SELECT stopped FROM treasury').fetchone()[0]
             if report['eligible'] and report.get('protocol')==PROTOCOL and not stopped:
                 m.event(c,'candidate_decision',{'agent':a,'round':rid,'decision':m.stage_candidate(c,a,report['strategy'],b['test_end'])})
-        c.execute("UPDATE batches SET state='done' WHERE id=?",(b['id'],)); m.event(c,'batch_finalized',{'batch':b['id'],'round':rid}); c.commit(); return {'status':'finalized','batch':b['id'],'round':rid}
+        c.execute("UPDATE batches SET state='done' WHERE id=?",(b['id'],)); m.event(c,'batch_finalized',{'batch':b['id'],'round':rid,'failed':failed}); c.commit(); return {'status':'partial; holdout consumed' if failed else 'finalized','batch':b['id'],'round':rid,'failed':failed}
+
+
+def abandon(path, now=None):
+    """Cancel incomplete jobs in the open batch, preserving completed evidence.
+
+    Token invalidation means a concurrently running worker cannot publish later.
+    This does not kill its OS process; use the process manager for that.
+    """
+    now=int(time.time()) if now is None else now; setup(path)
+    with m.db(path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        b=c.execute("SELECT id FROM batches WHERE state='open' ORDER BY id LIMIT 1").fetchone()
+        if not b: c.commit(); return {'status':'no open batch'}
+        count=c.execute("""UPDATE jobs SET state='failed',error='operator abandoned',token=NULL,lease_until=NULL
+            WHERE batch_id=? AND state NOT IN ('done','failed')""",(b['id'],)).rowcount
+        m.event(c,'batch_abandoned',{'batch':b['id'],'cancelled':count}); c.commit()
+    return finalize(path,now)
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument('--db',default='data/community.sqlite'); sub=p.add_subparsers(dest='cmd',required=True)
-    s=sub.add_parser('schedule'); s.add_argument('--csv')
+    s=sub.add_parser('schedule'); s.add_argument('--csv'); s.add_argument('--slots',type=int,choices=[1,2,3],default=3)
     w=sub.add_parser('worker'); w.add_argument('--agent',choices=list(m.AGENTS),required=True); w.add_argument('--model'); w.add_argument('--loop',action='store_true'); w.add_argument('--poll',type=int,default=15)
-    q=sub.add_parser('coordinate'); q.add_argument('--loop',action='store_true'); q.add_argument('--poll',type=int,default=60)
-    sub.add_parser('status')
+    q=sub.add_parser('coordinate'); q.add_argument('--loop',action='store_true'); q.add_argument('--poll',type=int,default=60); q.add_argument('--slots',type=int,choices=[1,2,3],default=3)
+    sub.add_parser('status'); sub.add_parser('abandon')
     x=p.parse_args(); cfg=m.config(x.db); setup(x.db)
     def out(r): print(json.dumps(r,indent=2),flush=True)
+    if x.cmd=='abandon': out(abandon(x.db)); return
     if x.cmd=='status':
         with m.db(x.db) as c: out([dict(r) for r in c.execute('SELECT batch_id,agent,state,attempts,error FROM jobs ORDER BY batch_id DESC,agent LIMIT 60')]); return
     if x.cmd=='schedule':
         if x.csv:
             archive.ingest(x.db,load_csv(x.csv,cfg['interval']*60),'csv'); bars=archive.latest(x.db)
         else: bars=archive.sync(x.db)
-        out(schedule(x.db,bars,'csv' if x.csv else 'kraken')); return
+        out(schedule(x.db,bars,'csv' if x.csv else 'kraken',slots=x.slots)); return
     if x.poll<5: p.error('poll >=5 seconds')
     while True:
         try:
             if x.cmd=='worker': out(work(x.db,x.agent,x.model))
             else:
                 out(finalize(x.db))
-                if not m.status(x.db)['stopped']: out(schedule(x.db,archive.sync(x.db),'kraken'))
+                if not m.status(x.db)['stopped']: out(schedule(x.db,archive.sync(x.db),'kraken',slots=x.slots))
         except (OSError,ValueError,RuntimeError,sqlite3.Error) as exc:
             out({'status':'cycle skipped','error':str(exc)})
             if not x.loop: raise
