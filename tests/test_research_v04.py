@@ -53,8 +53,26 @@ class V04(unittest.TestCase):
         s=Strategy('trend',5,20,'a'); a=reference(self.bars,s,Costs(),800,1000,600)
         self.assertEqual(a,reference(self.bars,s,Costs(),800,1000,600)); self.assertEqual(a['random_seeds'],31)
         self.assertGreaterEqual(a['random_p75'],a['random_median'])
-    def test_sync_failure_consumes_holdout(self):
-        with patch.object(m,'candidates',side_effect=RuntimeError('model down')):
+    def test_model_retries_empty_thinking_answer(self):
+        empty={'message':{'content':'','thinking':'reasoning'},'done_reason':'length'}
+        valid={'message':{'content':json.dumps({'strategies':[{'fast':3,'slow':11}]})}}
+        with patch.object(m,'request',side_effect=[empty,valid]) as req:
+            c=m.candidates('trend','qwen3:4b',self.bars[:400],'alpha',[])
+        self.assertEqual(c[-1].fast,3)
+        self.assertEqual([call.args[1]['options']['num_predict'] for call in req.call_args_list],[2048,4096])
+        self.assertTrue(all(call.args[1]['think'] is False for call in req.call_args_list))
+    def test_model_invalid_response_fails_explicitly(self):
+        with patch.object(m,'request',return_value={'message':{'content':'{"strategies":null}'}}) as req:
+            with self.assertRaisesRegex(RuntimeError,'no valid proposal JSON for alpha'):
+                m.candidates('trend','qwen3:4b',self.bars[:400],'alpha',[])
+        self.assertEqual(req.call_count,2)
+    def test_sync_proposal_failure_preserves_holdout(self):
+        with patch.object(m,'candidates',side_effect=RuntimeError('model down')), patch.object(m,'assess') as assess:
+            with self.assertRaises(RuntimeError): m.research(self.path,self.bars,'csv',now=self.now)
+            assess.assert_not_called()
+        self.assertEqual(m.config(self.path)['last_holdout'],0)
+    def test_sync_assessment_failure_consumes_holdout(self):
+        with patch.object(m,'assess',side_effect=RuntimeError('evaluation failed')):
             with self.assertRaises(RuntimeError): m.research(self.path,self.bars,'csv',now=self.now)
         self.assertEqual(m.config(self.path)['last_holdout'],self.bars[-1].ts)
         self.assertEqual(m.research(self.path,self.bars,'csv',now=self.now)['status'],'waiting for new unseen data')

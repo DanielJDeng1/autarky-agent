@@ -77,6 +77,24 @@ def config(path):
         return dict(row)
 
 
+def model_proposals(payload, agent):
+    """Require complete JSON answers; never parse the model's reasoning as a proposal."""
+    for budget in (2048, 4096):
+        request_body={**payload, 'options':{**payload['options'], 'num_predict':budget}}
+        response=request('http://127.0.0.1:11434/api/chat',request_body)
+        try:
+            content=response['message']['content']
+            if not isinstance(content,str) or not content.strip():
+                raise ValueError('empty answer')
+            result=json.loads(content)
+            if not isinstance(result,dict) or not isinstance(result.get('strategies'),list) or not isinstance(result.get('predictors',[]),list):
+                raise ValueError('expected strategy and predictor arrays')
+            return result
+        except (KeyError,TypeError,ValueError):
+            reason=response.get('done_reason','unknown') if isinstance(response,dict) else 'unknown'
+    raise RuntimeError(f'Ollama {payload["model"]} returned no valid proposal JSON for {agent} after two attempts (done_reason={reason}); verify model and server')
+
+
 def candidates(family, model, training, agent, prior):
     # Agents have disjoint strategy families; prior reports contain training/validation only.
     defaults=[Strategy(family,f,s,f'{agent}-{f}-{s}') for f,s in [(5,20),(12,48),(8,35),(20,80)]]
@@ -93,8 +111,8 @@ def candidates(family, model, training, agent, prior):
     summary={'n':len(training),'return':training[-1].close/training[0].close-1,'mean':sum(returns)/len(returns),'volatility':math.sqrt(sum(x*x for x in returns)/len(returns)),'prior_training_validation':prior}
     schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'},'filters':filter_schema(),'hypothesis':{'type':'string','maxLength':500}},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
     schema['properties']['predictors']={'type':'array','maxItems':3,'items':{'type':'object','properties':{'window':{'type':'integer','minimum':4,'maximum':100},'ridge':{'type':'number','minimum':.01,'maximum':100},'threshold':{'type':'number','minimum':0,'maximum':.02},'hypothesis':{'type':'string','maxLength':500}},'required':['window','ridge','threshold'],'additionalProperties':False}}
-    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five falsifiable hypotheses with 2 <= fast < slow <= 100. Explain each in hypothesis (max 500 characters): what pattern, why it may persist, and what would disprove it. Avoid repeating failed prior configurations. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. You may also propose up to three predictors: ridge regression on momentum, SMA distance, volatility and RSI, window 4..100, ridge .01..100, threshold 0..0.02 predicted one-bar return. Justify each hypothesis; model fitting is deterministic on training data only. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
-    result=json.loads(r['message']['content']); proposed=result['strategies']
+    payload={'model':model,'stream':False,'think':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five falsifiable hypotheses with 2 <= fast < slow <= 100. Explain each in hypothesis (max 500 characters): what pattern, why it may persist, and what would disprove it. Avoid repeating failed prior configurations. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. You may also propose up to three predictors: ridge regression on momentum, SMA distance, volatility and RSI, window 4..100, ridge .01..100, threshold 0..0.02 predicted one-bar return. Justify each hypothesis; model fitting is deterministic on training data only. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':2048}}
+    result=model_proposals(payload, agent); proposed=result['strategies']
     for x in proposed[:5]:
         try:
             s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}',x.get('filters',()),x.get('hypothesis',''))
@@ -158,10 +176,20 @@ def research(path, bars, source, model=None, now=None):
         for a in AGENTS:
             row=c.execute('SELECT report FROM trials WHERE agent=? ORDER BY round_id DESC LIMIT 1',(a,)).fetchone()
             prior[a]=json.loads(row[0])['candidates'][:3] if row else []
-        # Consume the holdout before evaluation, even if inference or a later write fails.
+        c.commit()
+    # Proposal generation sees only training data. Do not burn unseen test data if
+    # Ollama fails before any assessment. No SQLite write lock during inference.
+    plans={a:candidates(f,model,bars[:train_end],a,prior[a]) for a,f in AGENTS.items()}
+    with db(path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        current=c.execute('SELECT last_holdout,stopped FROM treasury').fetchone()
+        if current['stopped']: return {'status':'stopped'}
+        if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='batches'").fetchone() and c.execute("SELECT id FROM batches WHERE state='open'").fetchone(): raise ValueError('Queued research batch open; finalize it first')
+        if current['last_holdout']!=cfg['last_holdout']: raise ValueError('Research state changed; retry with fresh data')
+        # Consume before any assessment, including crashes or failed evaluation.
         c.execute('UPDATE treasury SET last_holdout=?',(end,))
         event(c,'holdout_reserved',{'start':bars[hold].ts,'end':end,'source':source}); c.commit()
-    reports={a:assess(bars,candidates(f,model,bars[:train_end],a,prior[a]),hold) for a,f in AGENTS.items()}
+    reports={a:assess(bars,plans[a],hold) for a in AGENTS}
     with db(path) as c:
         c.execute('BEGIN IMMEDIATE')
         current=c.execute('SELECT last_holdout,stopped FROM treasury').fetchone()
@@ -337,8 +365,9 @@ def main():
         try:
             bars=kraken(cfg['pair'],cfg['interval']); bid,ask=quote(cfg['pair']); out(tick(x.db,bars,bid,ask)); out(rebalance(x.db))
             if not x.paper_only and time.time()>=next_research and not status(x.db)['stopped']:
-                next_research=time.time()+x.research_hours*3600
+                next_research=time.time()+300  # Retry a failed research cycle in five minutes.
                 archive.ingest(x.db,bars,'kraken'); out(research(x.db,archive.latest(x.db),'kraken',x.model))
+                next_research=time.time()+x.research_hours*3600
         except (OSError,ValueError,RuntimeError,KeyError,TypeError,sqlite3.Error) as e:
             out({'status':'cycle skipped','error':str(e)})
             if x.once: raise
