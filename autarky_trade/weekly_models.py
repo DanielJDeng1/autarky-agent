@@ -38,7 +38,11 @@ def fit(rows, spec):
     return lambda x: mu+sum(w*(x[k]-m)/s for w,k,m,s in zip(weights,spec,means,scales))
 
 
-def review(parts, pair, cutoff, now=None):
+def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None):
+    specs = SPECS if specs is None else specs
+    fitter = (lambda name, rows, spec: fit(rows, spec)) if fitter is None else fitter
+    if not specs or len(specs) > 16:
+        raise ValueError("Require 1..16 model specifications")
     now = int(time.time()) if now is None else now
     if pair not in ('XBTUSD','ETHUSD') or not parts or not all(parts) or parts[-1][-1].ts > cutoff or parts[-1][-1].ts+3600 > now:
         raise ValueError('Require closed hourly history at cutoff')
@@ -47,8 +51,8 @@ def review(parts, pair, cutoff, now=None):
         if (previous is not None and bars[0].ts <= previous+3600) or any(b.ts-a.ts != 3600 for a,b in zip(bars,bars[1:])):
             raise ValueError('Require ordered contiguous segments separated by gaps')
         previous = bars[-1].ts
-    keys = set(k for spec in SPECS.values() for k in spec)
-    training = []; history = {name:[] for name in SPECS}; windows = []
+    keys = set(k for spec in specs.values() for k in spec)
+    training = []; history = {name:[] for name in specs}; windows = []
     for bars in parts:
         if len(bars)<lab.WARMUP+720:
             continue
@@ -65,10 +69,10 @@ def review(parts, pair, cutoff, now=None):
             if len(past)>=MIN_TRAIN:
                 record={'start':ts,'year':datetime.fromtimestamp(ts,timezone.utc).year,
                         'train_count':len(past),'train_last_label_end':past[-1]['label_end'],'models':{}}
-                for name,spec in SPECS.items():
+                for name,spec in specs.items():
                     prior=[r for r in history[name] if r['label_end']<ts][-LOOKBACK:]
                     threshold=fa.calibrate(prior)
-                    predict=fit(past,spec)
+                    predict=fitter(name,past,spec)
                     samples=[{k:r[k] for k in ('start','label_end','realized')} | {'prediction':predict(r['features'])} for r in rows]
                     picked={i for i,r in enumerate(samples) if threshold is not None and r['prediction']>threshold}
                     record['models'][name]={'threshold':threshold,'calibration_count':len(prior),
@@ -85,7 +89,7 @@ def review(parts, pair, cutoff, now=None):
         if not items:
             return {}
         result={}
-        for name in SPECS:
+        for name in specs:
             ms=[w['models'][name] for w in items]; rows=[r for m in ms for r in m['samples']]
             result[name]={'windows':len(items),'observations':len(rows),
                 'rmse':math.sqrt(statistics.mean((r['prediction']-r['realized'])**2 for r in rows)),
