@@ -1,8 +1,12 @@
 # Autarky — autonomous trading research community
 
-**v0.7.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
+**v0.8.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
 
 Conway-inspired economic selection for a population of trading research agents. Alpha researches trends, Beta mean reversion, Gamma breakouts. Each can run in its own process, maintains persistent research and paper-account state, and receives resources according to observed performance. The local model proposes bounded strategy parameters; deterministic code performs all calculations and trading decisions. No paid AI API is required. This is experimental quantitative research software, not a profitable trading system or a financial recommendation.
+
+## v0.8 — unified multi-market paper portfolio
+
+See [PORTFOLIO_V08.md](PORTFOLIO_V08.md) for the complete setup, risk limits, accounting and migration decisions. The new portfolio engine registers frozen eligible trials from BTC and ETH research databases into a separate shared paper treasury, checks synchronized quotes and aggregate exposure, records simulated executions and transfers, and redistributes flat cash using forward strategy NAV. Existing research balances are not deposits into the portfolio. No live orders, credentials, or actual revenue.
 
 ## v0.6 — predictive research and resource accounting
 
