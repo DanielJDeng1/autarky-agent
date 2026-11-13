@@ -1,8 +1,12 @@
 # Autarky — autonomous trading research community
 
-**v0.9.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
+**v0.10.0 · paper research + separate operator-controlled live pilot · Python 3.11+ · Ollama optional · SQLite**
 
 Conway-inspired economic selection for a population of trading research agents. Alpha researches trends, Beta mean reversion, Gamma breakouts. Each can run in its own process, maintains persistent research and paper-account state, and receives resources according to observed performance. The local model proposes bounded strategy parameters; deterministic code performs all calculations and trading decisions. No paid AI API is required. This is experimental quantitative research software, not a profitable trading system or a financial recommendation.
+
+## v0.10 — bounded live execution pilot
+
+See [LIVE_PILOT_V10.md](LIVE_PILOT_V10.md) for the complete operating guide. A separate live ledger can arm one frozen BTC/USD or ETH/USD strategy only after a completed, passing single-market prospective final evaluation. It requires a dedicated USD-only account, restricted API key, explicit operator confirmation for every real IOC limit order, hard notional and loss limits, durable intents and exchange-confirmed reconciliation. It is not an autonomous live trading loop. No real orders were placed during development; no profit or operational readiness is established. The research, paper portfolio and v0.9 validation tools remain independent and cannot place live orders.
 
 ## v0.9 — authenticated exchange validation gateway
 

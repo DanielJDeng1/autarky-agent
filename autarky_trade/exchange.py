@@ -84,13 +84,15 @@ class Kraken:
         except (OSError, TimeoutError, ValueError) as e:
             raise ExchangeUnavailable('Exchange request failed') from e
 
-    def _private(self, method, fields):
+    def _check_private(self, method, fields):
         if method not in self.READ and method != 'AddOrder':
             raise ValueError('Private endpoint forbidden')
         if method == 'AddOrder':
             allowed = {'pair', 'type', 'ordertype', 'volume', 'price', 'cl_ord_id', 'validate'}
             if set(fields) != allowed or fields['validate'] != 'true' or fields['ordertype'] != 'limit':
                 raise ValueError('Only validation-only spot limit orders are permitted')
+    def _private(self, method, fields):
+        self._check_private(method, fields)
         if 'nonce' in fields:
             raise ValueError('Nonce is generated internally')
         path = '/0/private/' + method
