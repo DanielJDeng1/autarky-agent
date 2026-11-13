@@ -3,6 +3,7 @@ import csv, json, math, urllib.request, urllib.parse, time, random
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from .signals import normalize, passes
+from .models import normalize_model, predict
 
 @dataclass(frozen=True)
 class Bar:
@@ -21,14 +22,20 @@ class Strategy:
     name: str
     filters: tuple = ()
     hypothesis: str = ""
+    model: dict | None = None
     def __post_init__(self):
-        if self.kind not in ('trend','breakout','reversion') or type(self.fast) is not int or type(self.slow) is not int or not 2 <= self.fast < self.slow <= 100 or not isinstance(self.name,str) or not 1 <= len(self.name) <= 80:
+        if self.kind not in ('trend','breakout','reversion','ridge') or type(self.fast) is not int or type(self.slow) is not int or not 2 <= self.fast < self.slow <= 100 or not isinstance(self.name,str) or not 1 <= len(self.name) <= 80:
             raise ValueError('Invalid strategy')
         if not isinstance(self.hypothesis,str) or len(self.hypothesis)>500:
             raise ValueError('Invalid hypothesis')
         object.__setattr__(self, 'filters', normalize(self.filters))
+        object.__setattr__(self, 'model', normalize_model(self.model))
+        if (self.kind=='ridge') != (self.model is not None): raise ValueError('Model artifact required only for ridge')
     def signal(self, closes):
         if len(closes) < self.slow or not passes(self.filters, closes): return False
+        if self.kind=='ridge':
+            prediction=predict(self.model,closes)
+            return prediction is not None and prediction>self.model['threshold']
         f=sum(closes[-self.fast:])/self.fast; s=sum(closes[-self.slow:])/self.slow
         if self.kind=='trend': return f>s
         if self.kind=='breakout': return closes[-1]>max(closes[-self.slow:-1])
@@ -108,15 +115,25 @@ class Account:
         e=self.equity(price); self.peak=max(self.peak,e); self.drawdown=max(self.drawdown,1-e/self.peak)
         if self.drawdown>=.08: self.stopped=True
 
-def backtest(bars,strategy,costs,start,end,capital=1000.):
+def backtest_path(bars,strategy,costs,start,end,capital=1000.):
+    if not 0 <= start < end <= len(bars): raise ValueError('Invalid backtest interval')
     a=Account(cash=capital,peak=capital); closes=[b.close for b in bars[:start]]
-    for b in bars[start:end]:
+    equity=[capital]
+    for i,b in enumerate(bars[start:end],start):
         # Signal sees only prior completed candles. Fill at next open, not same close.
+        a.mark(b.open)  # A gap through the risk limit must not permit a fresh entry.
         a.fill(strategy.signal(closes) and not a.stopped,b.open,b.open,costs)
         a.mark(b.close); closes.append(b.close)
-    if a.units: a.fill(False,bars[end-1].close,bars[end-1].close,costs)
-    a.mark(bars[end-1].close)
-    return {'return':a.cash/capital-1,'trades':a.trades,'fees':a.fees,'drawdown':a.drawdown,'stopped':a.stopped}
+        if i==end-1:
+            if a.units: a.fill(False,b.close,b.close,costs)
+            a.mark(b.close)
+        equity.append(a.equity(b.close))
+    metrics={'return':a.cash/capital-1,'trades':a.trades,'fees':a.fees,'drawdown':a.drawdown,'stopped':a.stopped}
+    return metrics,[math.log(y/x) for x,y in zip(equity,equity[1:])]
+
+
+def backtest(bars,strategy,costs,start,end,capital=1000.):
+    return backtest_path(bars,strategy,costs,start,end,capital)[0]
 
 def evaluate(bars,strategies,costs):
     n=len(bars); split=int(n*.6); hold=int(n*.8)

@@ -34,7 +34,7 @@ class CommunityTests(unittest.TestCase):
         m.research(self.path,self.bars,'csv',now=self.now)
         with m.db(self.path) as c:
             rows=list(c.execute('SELECT * FROM trials')); self.assertEqual(len(rows),3)
-            for r in rows: self.assertEqual(json.loads(r['report'])['strategy']['kind'],m.AGENTS[r['agent']])
+            for r in rows: self.assertIn(json.loads(r['report'])['strategy']['kind'],(m.AGENTS[r['agent']],'ridge'))
     def test_pending_cannot_trade_on_holdout(self):
         self.activate(after=self.ts); r=m.tick(self.path,self.rising(),100,101,self.now); self.assertEqual(r['agents']['alpha']['fills'],0)
     def test_tick_idempotent_and_capital_conserved(self):
@@ -75,6 +75,6 @@ class CommunityTests(unittest.TestCase):
         self.assertFalse(any(a['eligible_for_manual_review'] for a in m.readiness(self.path)['agents']))
     def test_local_model_rejects_invalid_candidates(self):
         with patch.object(m,'request',return_value={'message':{'content':json.dumps({'strategies':[{'fast':2,'slow':10},{'fast':99,'slow':1},{'fast':True,'slow':10}]})}}):
-            c=m.candidates('trend','qwen',self.bars[:500],'alpha',[]); self.assertEqual(len(c),5)
+            c=m.candidates('trend','qwen',self.bars[:500],'alpha',[]); self.assertEqual(len(c),6)
 
 if __name__=='__main__': unittest.main()

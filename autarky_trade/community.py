@@ -10,7 +10,8 @@ import sqlite3
 import time
 
 from .signals import filter_schema
-from .research import assess
+from .research import assess, identity
+from .models import fit
 from . import paper_audit
 from .core import Account, Costs, Strategy, backtest, kraken, quote, load_csv, synthetic, validate, request
 
@@ -82,16 +83,30 @@ def candidates(family, model, training, agent, prior):
     # Diverse deterministic baselines remain available without a model.
     defaults[2]=Strategy(family,8,35,f'{agent}-8-35-filtered',({'feature':'volatility','window':20,'op':'lt','threshold':.03},))
     defaults[3]=Strategy(family,20,80,f'{agent}-20-80-filtered',({'feature':'momentum','window':12,'op':'gt','threshold':-.01},))
+    # Each agent tests a distinct predictive specification, fitted only on the training prefix.
+    window, ridge = {'trend':(20, .1), 'reversion':(12, 1.), 'breakout':(48, .5)}[family]
+    if len(training)>=window+102:
+        artifact=fit(training,window,ridge)
+        defaults.append(Strategy('ridge',2,window,f'{agent}-ridge',(),'Regularized one-bar open-to-open return forecast',artifact))
     if not model: return defaults
     returns=[b.close/a.close-1 for a,b in zip(training,training[1:])]
     summary={'n':len(training),'return':training[-1].close/training[0].close-1,'mean':sum(returns)/len(returns),'volatility':math.sqrt(sum(x*x for x in returns)/len(returns)),'prior_training_validation':prior}
     schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'},'filters':filter_schema(),'hypothesis':{'type':'string','maxLength':500}},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
-    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five falsifiable hypotheses with 2 <= fast < slow <= 100. Explain each in hypothesis (max 500 characters): what pattern, why it may persist, and what would disprove it. Avoid repeating failed prior configurations. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
-    proposed=json.loads(r['message']['content'])['strategies']
+    schema['properties']['predictors']={'type':'array','maxItems':3,'items':{'type':'object','properties':{'window':{'type':'integer','minimum':4,'maximum':100},'ridge':{'type':'number','minimum':.01,'maximum':100},'threshold':{'type':'number','minimum':0,'maximum':.02},'hypothesis':{'type':'string','maxLength':500}},'required':['window','ridge','threshold'],'additionalProperties':False}}
+    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five falsifiable hypotheses with 2 <= fast < slow <= 100. Explain each in hypothesis (max 500 characters): what pattern, why it may persist, and what would disprove it. Avoid repeating failed prior configurations. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. You may also propose up to three predictors: ridge regression on momentum, SMA distance, volatility and RSI, window 4..100, ridge .01..100, threshold 0..0.02 predicted one-bar return. Justify each hypothesis; model fitting is deterministic on training data only. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
+    result=json.loads(r['message']['content']); proposed=result['strategies']
     for x in proposed[:5]:
         try:
             s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}',x.get('filters',()),x.get('hypothesis',''))
             if not any((s.fast,s.slow,s.filters)==(d.fast,d.slow,d.filters) for d in defaults): defaults.append(s)
+        except (KeyError,TypeError,ValueError): continue
+    for x in result.get('predictors',[])[:3]:
+        try:
+            w,reg,threshold=x['window'],x['ridge'],x['threshold']
+            if type(w) is not int or not 4<=w<=100 or type(reg) not in (int,float) or not .01<=reg<=100 or type(threshold) not in (int,float) or not 0<=threshold<=.02: continue
+            artifact=fit(training,w,reg,threshold)
+            s=Strategy('ridge',2,w,f'{agent}-ridge-{w}',(),x.get('hypothesis',''),artifact)
+            if not any(identity(s)==identity(d) for d in defaults): defaults.append(s)
         except (KeyError,TypeError,ValueError): continue
     return defaults
 
@@ -99,7 +114,7 @@ def candidates(family, model, training, agent, prior):
 def same_strategy(left, right):
     if not left or not right: return False
     a,b=Strategy(**json.loads(left)),Strategy(**json.loads(right))
-    return (a.kind,a.fast,a.slow,a.filters)==(b.kind,b.fast,b.slow,b.filters)
+    return identity(a)==identity(b)
 
 
 FORWARD_FREEZE_SECONDS = 60*86400
@@ -127,7 +142,7 @@ def research(path, bars, source, model=None, now=None):
     if source!='synthetic' and bars[-1].ts+cfg['interval']*60>now: raise ValueError('History contains an incomplete/future candle')
     if source=='synthetic':
         # No synthetic evidence is written into a real community's research ledger.
-        return {'status':'synthetic demonstration only','reports':{a:assess(bars,candidates(f,None,bars[:int(len(bars)*.6)],a,[]),int(len(bars)*.8)) for a,f in AGENTS.items()}}
+        return {'status':'synthetic demonstration only','reports':{a:assess(bars,candidates(f,None,bars[:int(int(len(bars)*.8)*.75)],a,[]),int(len(bars)*.8)) for a,f in AGENTS.items()}}
     end=bars[-1].ts
     cutoff=next((i for i,b in enumerate(bars) if b.ts>cfg['last_holdout']),len(bars))
     hold=max(int(len(bars)*.8),cutoff)

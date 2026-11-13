@@ -1,8 +1,12 @@
 # Autarky — autonomous trading research community
 
-**v0.5.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
+**v0.6.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
 
 Conway-inspired economic selection for a population of trading research agents. Alpha researches trends, Beta mean reversion, Gamma breakouts. Each can run in its own process, maintains persistent research and paper-account state, and receives resources according to observed performance. The local model proposes bounded strategy parameters; deterministic code performs all calculations and trading decisions. No paid AI API is required. This is experimental quantitative research software, not a profitable trading system or a financial recommendation.
+
+## v0.6 — predictive research and resource accounting
+
+See [QUANT_METHODOLOGY.md](QUANT_METHODOLOGY.md) for the research protocol, literature, limitations and commands. Each research agent now includes CPU-trained ridge predictors and can propose bounded model hyperparameters through Ollama. Model artifacts are reproducible, frozen, and evaluated chronologically. Trial reports include rolling-origin refit diagnostics for a selected predictor, paired block-bootstrap uncertainty estimates and unique candidate counts. The paper simulator checks opening gaps before execution and benchmarks share the same simulator. Queued jobs renew leases and record resource usage; actual costs are recorded separately from simulated P&L with `python -m autarky_trade.resources status`. No real trading. Earlier release descriptions below are historical where they differ from v0.6.
 
 ## v0.5 — audit and hypothesis-driven research
 

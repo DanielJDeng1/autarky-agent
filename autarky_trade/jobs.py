@@ -6,6 +6,8 @@ import json
 import sqlite3
 import time
 import uuid
+import threading
+from . import resources
 
 from . import community as m, archive
 from .core import Bar, Strategy, kraken, load_csv, validate
@@ -91,19 +93,46 @@ def plan(path, job, model, training):
     return proposed
 
 
+def renew(path, job, now=None):
+    """Extend only a current, unexpired lease; cannot resurrect a stale worker."""
+    now=int(time.time()) if now is None else now
+    with m.db(path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        changed=c.execute("""UPDATE jobs SET lease_until=? WHERE batch_id=? AND agent=?
+            AND token=? AND state='running' AND lease_until>? AND EXISTS
+            (SELECT 1 FROM batches WHERE id=jobs.batch_id AND state='open')""",
+            (now+LEASE,job['batch'],job['agent'],job['token'],now)).rowcount
+        c.commit(); return changed==1
+
+
 def work(path, agent, model=None):
     j=claim(path,agent)
     if not j: return {'status':'idle','agent':agent}
+    started=time.monotonic(); cpu=time.process_time(); done=threading.Event()
+    def heartbeat():
+        # Do not renew indefinitely; an unresponsive experiment gets at most 30 minutes.
+        while not done.wait(LEASE/3):
+            if time.monotonic()-started>=1800: return
+            try:
+                if not renew(path,j): return
+            except sqlite3.Error: return
+    thread=threading.Thread(target=heartbeat,daemon=True); thread.start()
+    outcome='worker error'
     try:
         bars=[Bar(**b) for b in j['bars']]; hold=j['hold']
-        # The model only sees training summaries, never test data or execution credentials.
         proposed=plan(path,j,model,bars[:int(hold*.75)])
         report=m.assess(bars,proposed,hold)
         ok=finish(path,j,report=report)
-        return {'status':'completed' if ok else 'lease lost','agent':agent,'batch':j['batch']}
+        outcome='completed' if ok else 'lease lost'
+        return {'status':outcome,'agent':agent,'batch':j['batch']}
     except Exception as exc:
         finish(path,j,error=exc)
         return {'status':'worker error','agent':agent,'error':str(exc)}
+    finally:
+        done.set(); thread.join()
+        # Accounting telemetry is not a reason to lose an already committed result.
+        try: resources.record_usage(path,j,time.monotonic()-started,time.process_time()-cpu,outcome)
+        except sqlite3.Error: pass
 
 
 def finalize(path, now=None):

@@ -1,7 +1,7 @@
 """Cost-aware reference strategies; descriptive comparisons, not p-values."""
 from __future__ import annotations
 import random
-from .core import Account
+from .core import backtest
 
 
 def reference(bars, strategy, costs, start, end, train_end, seeds=31):
@@ -13,14 +13,12 @@ def reference(bars, strategy, costs, start, end, train_end, seeds=31):
     rise = min(1.,switches/(2*max(1,flags.count(False))))
     fall = min(1.,switches/(2*max(1,flags.count(True))))
     def simulate(draw):
-        a = Account(); state = False
-        for b in bars[start:end]:
-            state = draw(state)
-            a.fill(state and not a.stopped,b.open,b.open,costs)
-            a.mark(b.close)
-        a.fill(False,bars[end-1].close,bars[end-1].close,costs)
-        a.mark(bars[end-1].close)
-        return {'return':a.cash/1000-1,'drawdown':a.drawdown}
+        class Timing:
+            state=False
+            def signal(self, closes):
+                self.state=draw(self.state)
+                return self.state
+        return backtest(bars,Timing(),costs,start,end)
     # Same position fraction and costs as the candidate; cash is uninvested.
     buy_hold = simulate(lambda state: True)
     values = []
