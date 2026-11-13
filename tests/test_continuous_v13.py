@@ -81,6 +81,19 @@ class V13(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 with c.exclusive(p): pass
         with c.exclusive(p): pass
+    def test_lock_never_reads_or_writes_marker(self):
+        # Windows denies reads of a byte locked by another file handle.
+        # Lock an empty file directly; leave existing markers untouched.
+        p=self.root/'lock'
+        with c.exclusive(p):
+            with self.assertRaises(RuntimeError):
+                with c.exclusive(p): pass
+        self.assertEqual(p.read_bytes(),b'')
+        p.write_bytes(b'0')
+        with c.exclusive(p):
+            with self.assertRaises(RuntimeError):
+                with c.exclusive(p): pass
+        self.assertEqual(p.read_bytes(),b'0')
     def test_recovery_preserves_pending_as_interrupted(self):
         with closing(a.connect(self.db)) as db,db:
             db.execute("INSERT INTO sessions VALUES(1,0,'x',3,'alpha','running','{}')")

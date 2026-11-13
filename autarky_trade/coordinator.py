@@ -12,9 +12,9 @@ from . import lab, research_agent as agent
 def exclusive(path):
     """OS-managed lock releases even after a killed process; never delete lock file."""
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    # Windows byte-range locks may extend beyond EOF. Do not read/write
+    # the lock byte before acquiring it: another process may own it.
     with open(path,'a+b') as f:
-        f.seek(0)
-        if not f.read(1): f.write(b'0'); f.flush()
         f.seek(0)
         if sys.platform=='win32':
             import msvcrt
