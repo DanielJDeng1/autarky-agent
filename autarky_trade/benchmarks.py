@@ -19,14 +19,16 @@ def reference(bars, strategy, costs, start, end, train_end, seeds=31):
             a.fill(state and not a.stopped,b.open,b.open,costs)
             a.mark(b.close)
         a.fill(False,bars[end-1].close,bars[end-1].close,costs)
-        return a.cash/1000-1
+        a.mark(bars[end-1].close)
+        return {'return':a.cash/1000-1,'drawdown':a.drawdown}
     # Same position fraction and costs as the candidate; cash is uninvested.
     buy_hold = simulate(lambda state: True)
     values = []
     for seed in range(seeds):
         rng = random.Random(seed)
-        values.append(simulate(lambda state: rng.random() >= fall if state else rng.random() < rise))
+        values.append(simulate(lambda state: rng.random() >= fall if state else rng.random() < rise)['return'])
     values.sort()
-    return {'cash_return':0.,'fractional_buy_hold_return':buy_hold,
+    return {'cash_return':0.,'fractional_buy_hold_return':buy_hold['return'],
+            'fractional_buy_hold_score':buy_hold['return']-buy_hold['drawdown'],
             'random_median':values[len(values)//2],'random_p75':values[int(.75*(len(values)-1))],
             'random_seeds':seeds,'training_signal_occupancy':p,'training_switches':switches}

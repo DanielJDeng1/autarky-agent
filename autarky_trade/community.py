@@ -10,7 +10,7 @@ import sqlite3
 import time
 
 from .signals import filter_schema
-from .benchmarks import reference
+from .research import assess
 from .core import Account, Costs, Strategy, backtest, kraken, quote, load_csv, synthetic, validate, request
 
 AGENTS = {'alpha': 'trend', 'beta': 'reversion', 'gamma': 'breakout'}
@@ -84,12 +84,12 @@ def candidates(family, model, training, agent, prior):
     if not model: return defaults
     returns=[b.close/a.close-1 for a,b in zip(training,training[1:])]
     summary={'n':len(training),'return':training[-1].close/training[0].close-1,'mean':sum(returns)/len(returns),'volatility':math.sqrt(sum(x*x for x in returns)/len(returns)),'prior_training_validation':prior}
-    schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'},'filters':filter_schema()},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
-    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five hypotheses with 2 <= fast < slow <= 100. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
+    schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'},'filters':filter_schema(),'hypothesis':{'type':'string','maxLength':500}},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
+    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five falsifiable hypotheses with 2 <= fast < slow <= 100. Explain each in hypothesis (max 500 characters): what pattern, why it may persist, and what would disprove it. Avoid repeating failed prior configurations. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
     proposed=json.loads(r['message']['content'])['strategies']
     for x in proposed[:5]:
         try:
-            s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}',x.get('filters',()))
+            s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}',x.get('filters',()),x.get('hypothesis',''))
             if not any((s.fast,s.slow,s.filters)==(d.fast,d.slow,d.filters) for d in defaults): defaults.append(s)
         except (KeyError,TypeError,ValueError): continue
     return defaults
@@ -99,6 +99,23 @@ def same_strategy(left, right):
     if not left or not right: return False
     a,b=Strategy(**json.loads(left)),Strategy(**json.loads(right))
     return (a.kind,a.fast,a.slow,a.filters)==(b.kind,b.fast,b.slow,b.filters)
+
+
+FORWARD_FREEZE_SECONDS = 60*86400
+
+
+def stage_candidate(c, agent, strategy, holdout_end):
+    """Do not reset a forward trial merely because a new backtest looks good."""
+    r=c.execute('SELECT * FROM agents WHERE id=?',(agent,)).fetchone()
+    t=c.execute('SELECT last_ts,stopped FROM treasury').fetchone()
+    if t['stopped'] or Account(**json.loads(r['account'])).stopped: return 'risk stopped'
+    proposed=encode(strategy)
+    if any(same_strategy(proposed,old) for old in (r['active'],r['pending'])): return 'unchanged'
+    if r['pending']: return 'pending candidate already frozen'
+    if r['active'] and r['active_since'] is not None and t['last_ts']-r['active_since']<FORWARD_FREEZE_SECONDS:
+        return 'active forward trial frozen'
+    c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(proposed,holdout_end,agent))
+    return 'staged'
 
 
 def research(path, bars, source, model=None, now=None):
@@ -138,29 +155,11 @@ def research(path, bars, source, model=None, now=None):
         for a,r in reports.items():
             c.execute('INSERT INTO trials VALUES(?,?,?)',(rid,a,encode(r)))
             if r['eligible']:
-                current_agent=c.execute('SELECT active,pending FROM agents WHERE id=?',(a,)).fetchone()
-                proposed=encode(r['strategy'])
-                if not any(same_strategy(proposed,old) for old in (current_agent['active'],current_agent['pending'])):
-                    c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(proposed,end,a))
+                event(c,'candidate_decision',{'agent':a,'round':rid,'decision':stage_candidate(c,a,r['strategy'],end)})
         c.execute('UPDATE treasury SET last_holdout=?',(end,))
         event(c,'research',{'round':rid,'source':source,'model':model,'eligible':[a for a,r in reports.items() if r['eligible']]})
         c.commit()
     return {'status':'researched','round':rid,'test_start':bars[hold].ts,'test_end':end,'reports':reports}
-
-
-def assess(bars, strategies, hold):
-    split=int(hold*.75); n=len(bars)
-    rows=[]
-    for s in strategies:
-        train=backtest(bars,s,COSTS,100,split); val=backtest(bars,s,COSTS,split,hold)
-        rows.append({'strategy':asdict(s),'train':train,'validation':val})
-    rows.sort(key=lambda r:(r['validation']['return'],r['train']['return']),reverse=True)
-    winner=rows[0]; s=Strategy(**winner['strategy'])
-    test=backtest(bars,s,COSTS,hold,n); stress=backtest(bars,s,Costs(80,20),hold,n)
-    eligible=all(r['return']>0 and r['trades']>=4 and r['drawdown']<MAX_DRAWDOWN and not r['stopped'] for r in (winner['train'],winner['validation'],test,stress))
-    benchmarks=reference(bars,s,COSTS,hold,n,split)
-    eligible=eligible and test['return']>benchmarks['random_p75']
-    return {'strategy':asdict(s),'candidates':rows,'test':test,'stress':stress,'benchmarks':benchmarks,'eligible':eligible,'note':'Exploratory gate; random benchmark is descriptive, not a significance test.'}
 
 
 def tick(path, bars, bid, ask, now=None):
@@ -170,19 +169,33 @@ def tick(path, bars, bid, ask, now=None):
     if not 0<=now-end<=cfg['interval']*60+120 or not math.isfinite(bid) or not math.isfinite(ask) or not 0<bid<=ask: raise ValueError('Stale candle or invalid quote')
     with db(path) as c:
         c.execute('BEGIN IMMEDIATE'); t=c.execute('SELECT * FROM treasury').fetchone()
-        if ts<=t['last_ts']:
-            if ts==t['last_ts'] and t['stopped']:
-                # A manual halt can arrive between candle closes. Exit on the next poll.
-                changed=False
-                for r in c.execute('SELECT * FROM agents').fetchall():
-                    a=Account(**json.loads(r['account'])); before=a.trades
-                    a.fill(False,bid,ask,COSTS); a.mark(bid)
-                    if a.trades!=before:
-                        changed=True; c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,r['id']))
-                if changed:
-                    c.execute('UPDATE treasury SET last_bid=?',(bid,)); event(c,'halt_flatten',{'candle':ts,'bid':bid,'ask':ask}); c.commit()
-                    return {'status':'halted and flattened','ts':ts}
+        if ts<t['last_ts']:
             return {'status':'already processed','ts':ts}
+        if ts==t['last_ts']:
+            # Quotes can move sharply between candle closes. Revalue and enforce risk,
+            # but never execute a new strategy entry or count another observation.
+            rows=list(c.execute('SELECT * FROM agents ORDER BY id'))
+            states={r['id']:Account(**json.loads(r['account'])) for r in rows}
+            pre=t['reserve']+sum(a.equity(bid) for a in states.values())
+            peak=max(t['peak'],pre); stopped=bool(t['stopped']) or pre<=peak*(1-MAX_DRAWDOWN)
+            changed=False
+            for name,a in states.items():
+                before=a.trades; a.mark(bid)
+                if stopped or a.stopped: a.fill(False,bid,ask,COSTS); a.mark(bid)
+                changed=changed or a.trades!=before
+                c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
+            equity=t['reserve']+sum(a.equity(bid) for a in states.values())
+            if equity<=peak*(1-MAX_DRAWDOWN) and not stopped:
+                stopped=True
+                for name,a in states.items():
+                    before=a.trades; a.fill(False,bid,ask,COSTS); a.mark(bid)
+                    changed=changed or a.trades!=before
+                    c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
+            c.execute('UPDATE treasury SET last_bid=?,peak=?,stopped=?',(bid,peak,int(stopped)))
+            if stopped and not t['stopped']: event(c,'portfolio_stop',{'candle':ts,'bid':bid,'intrabar':True})
+            if changed: event(c,'halt_flatten' if stopped else 'agent_risk_flatten',{'candle':ts,'bid':bid,'ask':ask})
+            c.commit()
+            return {'status':'halted and flattened' if changed and stopped else 'risk flattened' if changed else 'already processed','ts':ts}
         rows=list(c.execute('SELECT * FROM agents ORDER BY id'))
         states={r['id']:Account(**json.loads(r['account'])) for r in rows}
         pre=t['reserve']+sum(a.equity(bid) for a in states.values()); peak=max(t['peak'],pre)
@@ -196,8 +209,9 @@ def tick(path, bars, bid, ask, now=None):
                 active,after,pending,pa=pending,pa,None,None
                 active_since=ts; active_fills=0; active_ticks=0; active_start_nav=a.cash/r['shares']
             # If candidate is pending, unwind existing strategy before switching; no overlapping positions.
-            signal=bool(active and ts>after and not pending and not stopped and not a.stopped and Strategy(**json.loads(active)).signal([b.close for b in bars]))
+            signal=bool(active and ts>after and not (pending and ts>pa) and not stopped and not a.stopped and Strategy(**json.loads(active)).signal([b.close for b in bars]))
             before=a.trades; a.fill(signal,bid,ask,COSTS); a.mark(bid)
+            if a.stopped: a.fill(False,bid,ask,COSTS); a.mark(bid); signal=False
             active_fills+=a.trades-before
             active_ticks+=int(bool(active))
             details[name]={'equity':a.equity(bid),'signal':signal,'fills':a.trades-before,'active':json.loads(active) if active else None}
@@ -229,9 +243,9 @@ def rebalance(path, now=None):
         if not t['last_ts'] or not 0<=now-(t['last_ts']+t['interval']*60)<=t['interval']*60+120: return {'status':'stale market; no allocation'}
         states={r['id']:Account(**json.loads(r['account'])) for r in rows}
         if any(a.units for a in states.values()): return {'status':'wait until all portfolios flat'}
-        eligible=[r for r in rows if r['first_tick'] is not None and t['last_ts']-r['first_tick']>=30*86400 and states[r['id']].trades>=20 and not states[r['id']].stopped and states[r['id']].cash/r['shares']>1]
+        eligible=[r for r in rows if r['active'] and not r['pending'] and r['active_since'] is not None and t['last_ts']-r['active_since']>=30*86400 and r['active_fills']>=20 and r['active_ticks']>=.95*(1+(t['last_ts']-r['active_since'])/(t['interval']*60)) and r['active_start_nav'] and not states[r['id']].stopped and states[r['id']].cash/r['shares']/r['active_start_nav']>1]
         if not eligible: return {'status':'insufficient positive forward evidence'}
-        best=max(eligible,key=lambda r:states[r['id']].cash/r['shares']-1-states[r['id']].drawdown)
+        best=max(eligible,key=lambda r:states[r['id']].cash/r['shares']/r['active_start_nav']-1-states[r['id']].drawdown)
         a=states[best['id']]; total=t['reserve']+sum(x.cash for x in states.values())
         amount=max(0,min(total*.05,t['reserve']-total*.15,total*.40-a.cash))
         if amount<.01: return {'status':'no available allocation'}

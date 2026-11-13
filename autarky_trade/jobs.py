@@ -8,7 +8,7 @@ import time
 import uuid
 
 from . import community as m, archive
-from .core import Bar, kraken, load_csv, validate
+from .core import Bar, Strategy, kraken, load_csv, validate
 
 LEASE = 600
 MAX_ATTEMPTS = 3
@@ -18,6 +18,7 @@ def setup(path):
     with m.db(path) as c:
         c.executescript('''
         CREATE TABLE IF NOT EXISTS batches(id INTEGER PRIMARY KEY, created INTEGER NOT NULL, source TEXT NOT NULL, test_start INTEGER NOT NULL, test_end INTEGER NOT NULL UNIQUE, hold_index INTEGER NOT NULL, bars TEXT NOT NULL, state TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS research_plans(batch_id INTEGER REFERENCES batches(id), agent TEXT REFERENCES agents(id), protocol TEXT NOT NULL, model TEXT, candidates TEXT NOT NULL, PRIMARY KEY(batch_id,agent));
         CREATE TABLE IF NOT EXISTS jobs(batch_id INTEGER REFERENCES batches(id), agent TEXT REFERENCES agents(id), state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, token TEXT, lease_until INTEGER, report TEXT, error TEXT, PRIMARY KEY(batch_id,agent));
         ''')
 
@@ -64,16 +65,40 @@ def finish(path, job, report=None, error=None, now=None):
         c.execute('UPDATE jobs SET state=?,report=?,error=?,token=NULL,lease_until=NULL WHERE batch_id=? AND agent=?',(state,m.encode(report) if error is None else None,str(error)[:500] if error else None,job['batch'],job['agent'])); c.commit(); return True
 
 
+def plan(path, job, model, training):
+    """Freeze proposals before assessment. A recovered worker uses the exact same plan."""
+    from .research import PROTOCOL
+    def existing(c):
+        row=c.execute('SELECT protocol,candidates FROM research_plans WHERE batch_id=? AND agent=?',(job['batch'],job['agent'])).fetchone()
+        if row:
+            if row['protocol']!=PROTOCOL: raise ValueError('Research protocol changed; abandon old batch')
+            return [Strategy(**s) for s in json.loads(row['candidates'])]
+    with m.db(path) as c:
+        found=existing(c)
+        if found is not None: return found
+        row=c.execute('SELECT report FROM trials WHERE agent=? ORDER BY round_id DESC LIMIT 1',(job['agent'],)).fetchone()
+        prior=json.loads(row[0])['candidates'][:3] if row else []
+    proposed=m.candidates(m.AGENTS[job['agent']],model,training,job['agent'],prior)
+    with m.db(path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute('SELECT state,token,lease_until FROM jobs WHERE batch_id=? AND agent=?',(job['batch'],job['agent'])).fetchone()
+        if not row or row['state']!='running' or row['token']!=job['token'] or row['lease_until']<=int(time.time()):
+            raise ValueError('Research lease lost before plan freeze')
+        found=existing(c)
+        if found is not None: return found
+        c.execute('INSERT INTO research_plans VALUES(?,?,?,?,?)',(job['batch'],job['agent'],PROTOCOL,model,m.encode([asdict(s) for s in proposed])))
+        c.commit()
+    return proposed
+
+
 def work(path, agent, model=None):
     j=claim(path,agent)
     if not j: return {'status':'idle','agent':agent}
     try:
         bars=[Bar(**b) for b in j['bars']]; hold=j['hold']
-        with m.db(path) as c:
-            row=c.execute('SELECT report FROM trials WHERE agent=? ORDER BY round_id DESC LIMIT 1',(agent,)).fetchone()
-            prior=json.loads(row[0])['candidates'][:3] if row else []
         # The model only sees training summaries, never test data or execution credentials.
-        report=m.assess(bars,m.candidates(m.AGENTS[agent],model,bars[:int(hold*.75)],agent,prior),hold)
+        proposed=plan(path,j,model,bars[:int(hold*.75)])
+        report=m.assess(bars,proposed,hold)
         ok=finish(path,j,report=report)
         return {'status':'completed' if ok else 'lease lost','agent':agent,'batch':j['batch']}
     except Exception as exc:
@@ -95,9 +120,10 @@ def finalize(path, now=None):
         rid=c.execute('INSERT INTO rounds(created,source,test_start,test_end,observations) VALUES(?,?,?,?,?)',(now,b['source'],b['test_start'],b['test_end'],len(json.loads(b['bars'])))).lastrowid
         for r in rows:
             report=json.loads(r['report']); a=r['agent']; c.execute('INSERT INTO trials VALUES(?,?,?)',(rid,a,r['report']))
-            if report['eligible']:
-                agent=c.execute('SELECT active,pending FROM agents WHERE id=?',(a,)).fetchone(); s=m.encode(report['strategy'])
-                if not any(m.same_strategy(s,old) for old in (agent['active'],agent['pending'])): c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(s,b['test_end'],a))
+            from .research import PROTOCOL
+            stopped=c.execute('SELECT stopped FROM treasury').fetchone()[0]
+            if report['eligible'] and report.get('protocol')==PROTOCOL and not stopped:
+                m.event(c,'candidate_decision',{'agent':a,'round':rid,'decision':m.stage_candidate(c,a,report['strategy'],b['test_end'])})
         c.execute("UPDATE batches SET state='done' WHERE id=?",(b['id'],)); m.event(c,'batch_finalized',{'batch':b['id'],'round':rid}); c.commit(); return {'status':'finalized','batch':b['id'],'round':rid}
 
 

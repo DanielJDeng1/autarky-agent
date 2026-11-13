@@ -1,8 +1,12 @@
 # Autarky — autonomous trading research community
 
-**v0.4.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
+**v0.5.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
 
 Conway-inspired economic selection for a population of trading research agents. Alpha researches trends, Beta mean reversion, Gamma breakouts. Each can run in its own process, maintains persistent research and paper-account state, and receives resources according to observed performance. The local model proposes bounded strategy parameters; deterministic code performs all calculations and trading decisions. No paid AI API is required. This is experimental quantitative research software, not a profitable trading system or a financial recommendation.
+
+## v0.5 — audit and hypothesis-driven research
+
+See [AUDIT_V05.md](AUDIT_V05.md) for the detailed audit, fixes, remaining design risks and upgrade guidance. The research gate now uses three validation subwindows, ranks pretest-pass candidates first, checks passive risk-adjusted performance, and models an additional historical half-spread proxy. Queued workers freeze proposals before evaluation; reports include the protocol, dataset fingerprint and per-candidate evidence. The optional model can propose a falsifiable hypothesis. Active forward strategies are frozen for 60 days, pending candidates cannot be overwritten, and capital allocation requires current-strategy evidence. Every fresh quote checks risk, even on an already processed candle. Paper only. The v0.4 description below is historical where it differs from v0.5.
 
 ## v0.4 — quantitative research expansion
 
@@ -108,13 +112,13 @@ python -m autarky_trade.community research --source csv --csv history/btc-hourly
 3. Backtests use signals from prior closed candles, fill at next open with assumed fees and slippage, and mark to market. The validation return ranks candidates; only each agent's winner receives a test and doubled-cost stress test. Require positive training, validation, test and stress returns, >=4 fills each, <8% drawdown, and no stop.
 4. Successful candidates become pending and may start paper trading only on a candle strictly after the holdout. Existing positions are closed before a changed strategy is activated. An identical re-selected strategy retains its forward record. Rejections do not automatically retire an already active strategy; its independent risk controls still apply.
 
-The gate is intentionally exploratory. Three simultaneous candidates, repeated experiments, finite data and regime changes mean a positive backtest is **not** proof of an edge. No p-value, multiple-testing adjustment, benchmark outperformance requirement, exchange order book replay, liquidity model, or cross-validation across multiple regimes is implemented. A future promotion process must add those checks. Store separate untouched final evaluation data outside the lab before changing algorithms.
+The gate is intentionally exploratory. Three simultaneous candidates, repeated experiments, finite data and regime changes mean a positive backtest is **not** proof of an edge. No formal p-value, multiple-testing adjustment, exchange order book replay, liquidity model, or cross-validation across multiple regimes is implemented. v0.5 adds three chronological validation windows and descriptive passive/random benchmark gates. A future promotion process must add those checks. Store separate untouched final evaluation data outside the lab before changing algorithms.
 
 ## 4. Paper economy and risk
 
 Each agent owns an independent simulated spot account; no shorts or leverage. A single position uses at most 25% of its available cash at entry. Orders are filled using a fresh public bid/ask observed by the process, plus 40 bps assumed fees and 10 bps extra slippage per side. These are configurable only in the older v0.2 path; community costs are pinned to prevent silently changing assumptions. Actual exchange fees, spreads and market impact differ. A candle is consumed once per market, and a transaction writes all accounts and the tick atomically. Missed candles are not replayed at fictional historical prices. Bid/ask quotes have no exchange-provided timestamp here; freshness is inferred from fetching them and the closed-candle clock. This is a simulation, not a realistic fill guarantee.
 
-A per-agent 8% maximum observed drawdown stops that agent; a portfolio-wide 8% observed drawdown latches the global stop and flattens positions at the observed simulated bid. Stops are checked on new closed candles, not continuously intrabar. A fast crash could exceed the threshold. The reserve cannot be spent on orders. The founder can allocate up to 5% of total equity from the reserve once per week, only when all agents are flat and the winning agent has at least 30 days since first activation, 20 fills, positive cumulative flow-adjusted return, and no risk stop. It retains at least 15% reserve and caps the receiving agent at 40% of equity at allocation time. Allocation uses share issuance at current NAV so transfers do not manufacture profits. Capital grows/shrinks with simulated P&L; no bank or exchange balance is connected. It does not yet withdraw capital from underperformers or spawn new agents automatically.
+A per-agent 8% maximum observed drawdown stops that agent; a portfolio-wide 8% observed drawdown latches the global stop and flattens positions at the observed simulated bid. Stops are checked on every fresh quote, including between candle closes; there is no continuous exchange-side stop. A fast crash could exceed the threshold. The reserve cannot be spent on orders. The founder can allocate up to 5% of total equity from the reserve once per week, only when all agents are flat and the winning agent has at least 30 days on the current strategy, 20 current-strategy fills, 95% candle coverage, positive current-strategy flow-adjusted return, and no risk stop. It retains at least 15% reserve and caps the receiving agent at 40% of equity at allocation time. Allocation uses share issuance at current NAV so transfers do not manufacture profits. Capital grows/shrinks with simulated P&L; no bank or exchange balance is connected. It does not yet withdraw capital from underperformers or spawn new agents automatically.
 
 ```sh
 python -m autarky_trade.community status
@@ -136,7 +140,7 @@ The original single-agent interface is retained (`python -m autarky_trade resear
 
 ## 6. Real trading roadmap — not implemented in this release
 
-No authenticated exchange endpoint, API key, wallet, real order submission, or live balance reconciliation exists in v0.3. No money can move. This is intentional: before real money is introduced the system needs evidence and a hardened execution boundary, not merely a `--live` switch.
+No authenticated exchange endpoint, API key, wallet, real order submission, or live balance reconciliation exists in v0.5. No money can move. This is intentional: before real money is introduced the system needs evidence and a hardened execution boundary, not merely a `--live` switch.
 
 1. Collect out-of-sample evidence across multiple years and regimes; compare against cash and passive BTC/ETH exposure of comparable risk. Account for costs and inference/electricity, benchmark-adjusted returns, multiple comparisons, liquidity and missing data. Independently reproduce results.
 2. Freeze one strategy/version, run forward paper for at least the readiness window, compare quote assumptions with actual available liquidity, and audit portfolio accounting. No model-driven parameter changes while measuring that strategy.

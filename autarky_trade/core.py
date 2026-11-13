@@ -20,9 +20,12 @@ class Strategy:
     slow: int
     name: str
     filters: tuple = ()
+    hypothesis: str = ""
     def __post_init__(self):
         if self.kind not in ('trend','breakout','reversion') or type(self.fast) is not int or type(self.slow) is not int or not 2 <= self.fast < self.slow <= 100 or not isinstance(self.name,str) or not 1 <= len(self.name) <= 80:
             raise ValueError('Invalid strategy')
+        if not isinstance(self.hypothesis,str) or len(self.hypothesis)>500:
+            raise ValueError('Invalid hypothesis')
         object.__setattr__(self, 'filters', normalize(self.filters))
     def signal(self, closes):
         if len(closes) < self.slow or not passes(self.filters, closes): return False
@@ -41,6 +44,7 @@ def request(url, payload=None):
 def validate(bars, interval=None):
     if len(bars)<220: raise ValueError('Need at least 220 complete candles; use longer CSV history for serious research')
     for i,b in enumerate(bars):
+        if type(b.ts) is not int or b.ts < 0: raise ValueError('Invalid candle timestamp')
         if not all(math.isfinite(v) for v in (b.open,b.high,b.low,b.close,b.volume)) or min(b.open,b.high,b.low,b.close)<=0 or b.volume<0 or b.low>min(b.open,b.close) or b.high<max(b.open,b.close): raise ValueError('Invalid candle')
         if i and (b.ts<=bars[i-1].ts or (interval and b.ts-bars[i-1].ts!=interval)): raise ValueError('Duplicate, unsorted or missing candle')
     return bars
