@@ -106,7 +106,7 @@ def calibrate(spec, rows):
     return max(candidates,key=lambda x:(x[1]['mean_stress_all'],x[0]))[0] if candidates else None
 
 
-def evaluate(parts,pair,cutoff,parent,candidate,now=None,*,other_parts=None):
+def evaluate(parts,pair,cutoff,parent,candidate,now=None,*,other_parts=None,horizon=None):
     configs={'parent':parent,'candidate':candidate}
     provider=None
     if other_parts is not None:
@@ -116,10 +116,10 @@ def evaluate(parts,pair,cutoff,parent,candidate,now=None,*,other_parts=None):
         provider=lambda bars,key: cross.series(bars,by_start[bars[0].ts],*key)
     report=wm.review(parts,pair,cutoff,now,specs={'mean':(),**{k:v.features for k,v in configs.items()}},
         fitter=lambda name,rows,keys: wm.fit(rows,()) if name=='mean' else fit(configs[name],rows),
-        calibrator=lambda name,rows: fa.calibrate(rows) if name=='mean' else calibrate(configs[name],rows),feature_provider=provider)
+        calibrator=lambda name,rows: (fa.calibrate(rows) if name=='mean' else calibrate(configs[name],rows)) if horizon is None else wm.horizon_calibrate(rows,horizon,name!='mean' and configs[name].calibration=='conservative'),feature_provider=provider,horizon=horizon)
     if other_parts is not None:
         other_pair=next(p for p in old.PAIRS if p!=pair)
-        report.update(protocol=cross.PROTOCOL,other_dataset_sha256=old.fingerprint(other_parts,other_pair))
+        report.update(protocol=cross.PROTOCOL if horizon is None else wm.HORIZON_PROTOCOL,other_dataset_sha256=old.fingerprint(other_parts,other_pair))
     return report
 
 
@@ -171,9 +171,9 @@ def legacy_evidence(path,hashes,cutoff):
         return output
 
 
-def parents(c,dataset):
+def parents(c,dataset,source_dataset=None):
     result=roots()
-    for row in c.execute("SELECT id,report FROM tree_nodes WHERE dataset=? AND status='complete' ORDER BY id",(dataset,)):
+    for row in c.execute("SELECT id,report FROM tree_nodes WHERE dataset IN (?,?) AND status='complete' ORDER BY id",(dataset,source_dataset or dataset)):
         result['node:'+str(row['id'])]=Spec(**json.loads(row['report'])['spec'])
     return result
 
@@ -201,12 +201,13 @@ def candidate_menu(agent, available, seen, context, limit=18):
     if cross_mode:
         focus={'alpha':('relative_strength','other_momentum'),'beta':cross.FEATURES,'gamma':('other_volatility','cross_correlation')}[agent]+focus
     recent=context.get('recent_nodes',{})
+    sources=context.get('source_nodes',{})
     legacy=context.get('legacy_measured',{})
     def score(name):
-        markets=recent.get(name,{}).get('markets',legacy.get(name,{}))
+        markets=recent.get(name,{}).get('markets',sources.get(name,{}).get('markets',legacy.get(name,{})))
         return min((m.get('stress',-1.) for m in markets.values()),default=-1.)
     # Keep the agent's anchor, a measured promising root, and recent children.
-    names=[preferred]+sorted(recent,key=score,reverse=True)+sorted(available,key=score,reverse=True)
+    names=[preferred]+sorted(recent,key=score,reverse=True)+sorted(sources,key=score,reverse=True)[:2]+sorted(available,key=score,reverse=True)
     names=list(dict.fromkeys(n for n in names if n in available))
     used=set(seen); menus=[]
     for name in names:
@@ -276,11 +277,12 @@ def propose(model,agent,available,seen,context,reject):
     relevant={p for p,_,_ in menu}
     evidence={k:v for k,v in context.get('legacy_measured',{}).items() if k in relevant}
     children={k:v for k,v in context.get('recent_nodes',{}).items() if k in relevant}
+    sources={k:v for k,v in context.get('source_nodes',{}).items() if k in relevant}
     prompt=(f'You are {agent}. Focus: {old.FOCUS[agent]}. Choose one numbered experiment. '
             'Every option is already validated and novel. Prefer improvement in stressed returns on both markets; '
             'negative returns are losses. Return only JSON with choice (integer) and hypothesis (a short question, no claimed results). '
             'Do not write a full specification. Example: {"choice":0,"hypothesis":"Does this change improve stressed returns?"}. '
-            + ('Cross-market mode: parent evidence from legacy single-market windows is contextual only; compare measured aligned results. ' if context.get('cross_asset') else '')+'Options: '+old.pack(choices)+' Measured parent evidence: '+old.pack({'roots':evidence,'children':children,'parent_specs':{p:asdict(available[p]) for p in sorted(relevant)}}))
+            + (f'Forecast horizon: {context["horizon_hours"]} hours. Legacy weekly evidence is contextual only. ' if context.get('horizon_hours') else '') + ('Cross-market mode: parent evidence from legacy single-market windows is contextual only; compare measured aligned results. ' if context.get('cross_asset') else '')+'Options: '+old.pack(choices)+' Measured parent evidence: '+old.pack({'roots':evidence,'children':children,'source_weekly_context_only':sources,'parent_specs':{p:asdict(available[p]) for p in sorted(relevant)}}))
     schema={'type':'object','properties':{'choice':{'type':'integer','minimum':0,'maximum':len(menu)-1},
             'hypothesis':{'type':'string','maxLength':300}},'required':['choice','hypothesis'],'additionalProperties':False}
     error='none'
@@ -299,7 +301,8 @@ def propose(model,agent,available,seen,context,reject):
     return default('deterministic_fallback')
 
 
-def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=None,*,cross_asset=False):
+def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=None,*,cross_asset=False,horizon=None):
+    if horizon is not None: wm.horizon_slots(horizon)
     if set(parts)!=set(old.PAIRS) or type(rounds) is not int or not 1<=rounds<=20 or type(budget) is not int or not 1<=budget<=3:
         raise ValueError('Both markets required; rounds 1..20, budget 1..3 per agent')
     if legacy and Path(path).resolve()==Path(legacy).resolve(): raise ValueError('Separate v0.17 ledger required')
@@ -311,6 +314,9 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
         parts=cross.align(parts)
         hashes={p:old.fingerprint(parts[p],p) for p in old.PAIRS}
         dataset=lab.digest([cross.PROTOCOL,cutoff,original_hashes,hashes])
+    source_dataset=dataset if horizon is not None else None
+    if horizon is not None:
+        dataset=lab.digest([wm.HORIZON_PROTOCOL,dataset,horizon])
     with exclusive(str(Path(path).resolve())+'.lock'),closing(connect(path)) as c:
         with c:
             for table in ('tree_runs','tree_nodes'):
@@ -318,18 +324,24 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
             record={'protocol':PROTOCOL,'dataset':dataset,'datasets':hashes,'cutoff':cutoff,'model':model,'completed':0,'rejected':0,'fallbacks':0,'legacy_evidence_loaded':bool(seed),'legacy_evidence':seed,'development_only':True,'eligible':False}
             if cross_asset:
                 record.update(research_mode=cross.PROTOCOL,source_datasets=original_hashes,aligned_bars=sum(map(len,parts['XBTUSD'])),aligned_segments=len(parts['XBTUSD']),legacy_evidence_context_only=True)
+            if horizon is not None:
+                record.update(research_mode=wm.HORIZON_PROTOCOL,horizon_hours=horizon,source_weekly_dataset=source_dataset,legacy_evidence_context_only=True)
             rid=c.execute('INSERT INTO tree_runs(dataset,status,report) VALUES(?,?,?)',(dataset,'running',old.pack(record))).lastrowid
         record['run_id']=rid; state='complete'
         try:
             for _ in range(rounds):
                 for agent in old.AGENTS:
                     for _ in range(budget):
-                        available=parents(c,dataset)
+                        available=parents(c,dataset,source_dataset)
                         seen={s.identity for s in available.values()}|{r[0] for r in c.execute('SELECT identity FROM tree_nodes WHERE dataset=?',(dataset,))}
                         recent={}
                         for row in c.execute("SELECT id,report FROM tree_nodes WHERE dataset=? AND status='complete' ORDER BY id DESC LIMIT 6",(dataset,)):
                             r=json.loads(row['report']); f=r['findings']; recent['node:'+str(row['id'])]={'classification':f['classification'],'markets':{p:{k:m[k] for k in ('net','stress','vs_parent','vs_mean','fills')} for p,m in f['markets'].items()}}
-                        context={'cross_asset':cross_asset,'legacy_measured':seed,'recent_nodes':recent,'warning':'Development only; no promotion. Net/stress are fractional returns. Negative is a loss.'}
+                        sources={}
+                        if source_dataset is not None:
+                            for row in c.execute("SELECT id,report FROM tree_nodes WHERE dataset=? AND status='complete' ORDER BY id DESC LIMIT 12",(source_dataset,)):
+                                r=json.loads(row['report']); f=r['findings']; sources['node:'+str(row['id'])]={'classification':f['classification'],'markets':{p:{k:m[k] for k in ('net','stress','vs_parent','vs_mean','fills')} for p,m in f['markets'].items()}}
+                        context={'source_nodes':sources,'horizon_hours':horizon,'cross_asset':cross_asset,'legacy_measured':seed,'recent_nodes':recent,'warning':'Development only; no promotion. Net/stress are fractional returns. Negative is a loss.'}
                         def reject(reason):
                             with c: c.execute('INSERT INTO tree_rejections(run,agent,reason) VALUES(?,?,?)',(rid,agent,reason))
                             record['rejected']+=1; emit({'event':'rejected','agent':agent,'reason':reason})
@@ -339,11 +351,13 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
                         if source=='deterministic_fallback':
                             record['fallbacks']+=1; emit({'event':'fallback','agent':agent,'reason':'Invalid Ollama choices; using validated deterministic candidate'})
                         r={'research_mode':cross.PROTOCOL if cross_asset else 'single_asset','proposal_source':source,'spec':asdict(spec),'parent_spec':asdict(available[parent]),'hypothesis_unverified':hypothesis,'development_only':True,'eligible':False}
+                        if horizon is not None:
+                            r.update(research_mode=wm.HORIZON_PROTOCOL,horizon_hours=horizon,cross_asset=cross_asset)
                         with c:
                             eid=c.execute('INSERT INTO tree_nodes(run,dataset,identity,parent,agent,status,report) VALUES(?,?,?,?,?,?,?)',(rid,dataset,spec.identity,parent,agent,'running',old.pack(r))).lastrowid
                         try:
                             emit({'event':'start','id':eid,'agent':agent,'parent':parent,'spec':asdict(spec),'proposal_source':source})
-                            reports={p:evaluate(parts[p],p,cutoff,available[parent],spec,other_parts=parts[next(q for q in old.PAIRS if q!=p)] if cross_asset else None) for p in old.PAIRS}
+                            reports={p:evaluate(parts[p],p,cutoff,available[parent],spec,other_parts=parts[next(q for q in old.PAIRS if q!=p)] if cross_asset else None,horizon=horizon) for p in old.PAIRS}
                             r.update(findings=facts(reports),results=reports)
                             with c:
                                 c.execute("UPDATE tree_nodes SET status='complete',report=? WHERE id=?",(old.pack(r),eid)); record['completed']+=1
@@ -379,7 +393,7 @@ def render(data):
     rows=[]
     for n in data['nodes']:
         f=n.get('findings',{}); m=f.get('markets',{}); b=m.get('XBTUSD',{}); e=m.get('ETHUSD',{})
-        rows.append('<tr>'+''.join(cell(v) for v in (n['id'],n.get('research_mode','single_asset'),n['parent'],n['agent'],n['status'],n['spec'],pct(b.get('net')),pct(b.get('stress')),pct(e.get('net')),pct(e.get('stress')),f.get('classification','—'),n.get('hypothesis_unverified','')) )+'</tr>')
+        rows.append('<tr>'+''.join(cell(v) for v in (n['id'],(str(n['horizon_hours'])+'h · '+('cross' if n.get('cross_asset') else 'single') if 'horizon_hours' in n else n.get('research_mode','single_asset')),n['parent'],n['agent'],n['status'],n['spec'],pct(b.get('net')),pct(b.get('stress')),pct(e.get('net')),pct(e.get('stress')),f.get('classification','—'),n.get('hypothesis_unverified','')) )+'</tr>')
     return '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="15"><title>Autarky Research Tree</title><style>body{font:15px system-ui;background:#101820;color:#eee;padding:24px}table{border-collapse:collapse}td,th{padding:8px;border:1px solid #456;text-align:left;vertical-align:top}a{color:#9df}</style><h1>Autarky / Research Tree</h1><p>Development only · no promotion · <a href="/api/status">JSON status</a></p><table><tr><th>ID</th><th>Mode</th><th>Parent</th><th>Agent</th><th>Status</th><th>Specification</th><th>BTC net</th><th>BTC stress</th><th>ETH net</th><th>ETH stress</th><th>Measured finding</th><th>Unverified hypothesis</th></tr>'+''.join(rows)+'</table>'
 
 
@@ -400,11 +414,11 @@ def serve(path,port):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument('--db',required=True); sub=p.add_subparsers(dest='cmd',required=True)
-    a=sub.add_parser('run'); a.add_argument('--btc',required=True); a.add_argument('--eth',required=True); a.add_argument('--cutoff',required=True,type=int); a.add_argument('--legacy'); a.add_argument('--model',default='qwen3:4b'); a.add_argument('--deterministic',action='store_true'); a.add_argument('--rounds',type=int,default=1); a.add_argument('--budget',type=int,default=1); a.add_argument('--cross-asset',action='store_true')
+    a=sub.add_parser('run'); a.add_argument('--btc',required=True); a.add_argument('--eth',required=True); a.add_argument('--cutoff',required=True,type=int); a.add_argument('--legacy'); a.add_argument('--model',default='qwen3:4b'); a.add_argument('--deterministic',action='store_true'); a.add_argument('--rounds',type=int,default=1); a.add_argument('--budget',type=int,default=1); a.add_argument('--cross-asset',action='store_true'); a.add_argument('--horizon',type=int,choices=wm.HORIZONS)
     sub.add_parser('status'); d=sub.add_parser('dashboard'); d.add_argument('--port',type=int,default=8767); x=p.parse_args()
     if x.cmd=='run':
         if len({Path(y).resolve() for y in (x.db,x.btc,x.eth)})!=3: p.error('Use separate data files and research database')
-        run(x.db,{'XBTUSD':multiyear.segments(x.btc,x.cutoff),'ETHUSD':multiyear.segments(x.eth,x.cutoff)},x.cutoff,x.legacy,None if x.deterministic else x.model,x.rounds,x.budget,cross_asset=x.cross_asset)
+        run(x.db,{'XBTUSD':multiyear.segments(x.btc,x.cutoff),'ETHUSD':multiyear.segments(x.eth,x.cutoff)},x.cutoff,x.legacy,None if x.deterministic else x.model,x.rounds,x.budget,cross_asset=x.cross_asset,horizon=x.horizon)
     elif x.cmd=='status': print(json.dumps(status(x.db),indent=2,allow_nan=False))
     else: serve(x.db,x.port)
 

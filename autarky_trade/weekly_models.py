@@ -12,6 +12,25 @@ from .models import solve
 
 MIN_TRAIN = 24
 LOOKBACK = 104
+HORIZONS = (24, 72, 168, 336)
+HORIZON_PROTOCOL = "v0.20-horizon-1"
+
+
+def horizon_slots(horizon):
+    if type(horizon) is not int or horizon not in HORIZONS:
+        raise ValueError("Unsupported forecast horizon")
+    return (720-1)//horizon
+
+
+def horizon_calibrate(rows, horizon, conservative=False):
+    slots = horizon_slots(horizon)
+    # Match the number of preceding evaluation windows, not the number of labels.
+    if len(rows) < (18 if conservative else 12)*slots:
+        return None
+    minimum = max(16 if conservative else 8, (4 if conservative else 2)*slots)
+    options = [(t, fa.selection(rows,t)) for t in fa.THRESHOLDS]
+    options = [(t,m) for t,m in options if m["selected"] >= minimum and m["mean_stress_all"] > 0]
+    return max(options,key=lambda x:(x[1]["mean_stress_all"],x[0]))[0] if options else None
 SPECS = {
     'mean': (),
     'ridge_four': (('momentum',72),('distance',72),('volatility',72),('rsi',72)),
@@ -38,10 +57,15 @@ def fit(rows, spec):
     return lambda x: mu+sum(w*(x[k]-m)/s for w,k,m,s in zip(weights,spec,means,scales))
 
 
-def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator=None, feature_provider=None):
+def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator=None, feature_provider=None, horizon=None):
+    # None is the unchanged legacy weekly protocol; explicit 168 uses the new protocol.
+    h = 168 if horizon is None else horizon
+    slots = horizon_slots(h)
+    min_train = MIN_TRAIN if horizon is None else 12*slots
+    lookback = LOOKBACK if horizon is None else 26*slots
     specs = SPECS if specs is None else specs
     fitter = (lambda name, rows, spec: fit(rows, spec)) if fitter is None else fitter
-    calibrator = (lambda name, rows: fa.calibrate(rows)) if calibrator is None else calibrator
+    calibrator = (lambda name, rows: fa.calibrate(rows) if horizon is None else horizon_calibrate(rows,h)) if calibrator is None else calibrator
     if not specs or len(specs) > 16:
         raise ValueError("Require 1..16 model specifications")
     now = int(time.time()) if now is None else now
@@ -68,20 +92,20 @@ def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator
             else: raise ValueError('External feature requires aligned market data')
         for start in range(lab.WARMUP,len(bars)-719,720):
             ts=bars[start].ts; end=start+720
-            past=[r for r in training if r['label_end']<ts][-LOOKBACK:]
+            past=[r for r in training if r['label_end']<ts][-lookback:]
             rows=[]
-            for i in range(start,end-168,168):
+            for i in range(start,end-h,h):
                 # A missing volume ratio (zero preceding volume) is neutral at one.
                 if any(series[k][i] is None for k in keys if k[0] not in lab.FEATURES):
                     raise ValueError('Missing aligned external feature at decision')
                 x={k:series[k][i] if series[k][i] is not None else 1.0 for k in keys}
-                rows.append({'start':bars[i].ts,'label_end':bars[i+168].ts,
-                             'realized':bars[i+168].open/bars[i].open-1,'features':x})
-            if len(past)>=MIN_TRAIN:
+                rows.append({'start':bars[i].ts,'label_end':bars[i+h].ts,
+                             'realized':bars[i+h].open/bars[i].open-1,'features':x})
+            if len(past)>=min_train:
                 record={'start':ts,'year':datetime.fromtimestamp(ts,timezone.utc).year,
                         'train_count':len(past),'train_last_label_end':past[-1]['label_end'],'models':{}}
                 for name,spec in specs.items():
-                    prior=[r for r in history[name] if r['label_end']<ts][-LOOKBACK:]
+                    prior=[r for r in history[name] if r['label_end']<ts][-lookback:]
                     threshold=calibrator(name,prior)
                     predict=fitter(name,past,spec)
                     samples=[{k:r[k] for k in ('start','label_end','realized')} | {'prediction':predict(r['features'])} for r in rows]
@@ -95,7 +119,7 @@ def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator
                 windows.append(record)
             training.extend(rows)
     if not windows:
-        raise ValueError('Insufficient completed weekly training labels')
+        raise ValueError('Insufficient completed training labels')
     def summarize(items):
         if not items:
             return {}
@@ -112,13 +136,19 @@ def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator
                 'active_windows':sum(m['normal']['fills']>0 for m in ms)}
         return result
     years=sorted({w['year'] for w in windows})
-    return {'protocol':'v0.14-weekly-models-1','pair':pair,'cutoff':cutoff,
+    report = {'protocol':'v0.14-weekly-models-1','pair':pair,'cutoff':cutoff,
             'dataset_sha256':lab.digest([pair,[[asdict(b) for b in s] for s in parts]]),
             'development_only':True,'eligible':False,'windows':len(windows),
             'summary':summarize(windows),'post_2017':summarize([w for w in windows if w['year']>=2018]),
             'years':{str(y):summarize([w for w in windows if w['year']==y]) for y in years},
             'exclude_year':{str(y):summarize([w for w in windows if w['year']!=y]) for y in years},
             'details':windows,'note':'Same nonoverlapping completed weekly labels for all models; up to 104 training and calibration observations, minimum 24. Fixed ridge penalty 1. Fresh monthly accounts and cash abstention. Year exclusion describes concentration, not a refit or holdout.'}
+
+    if horizon is not None:
+        report.update(protocol=HORIZON_PROTOCOL,horizon_hours=h,opportunities_per_window=slots,
+                      min_train_observations=min_train,lookback_observations=lookback,
+                      note='Development only. Fresh 30-day accounts; nonoverlapping open-to-open labels, 12 prior observed windows minimum, rolling 26 windows. Standard calibration requires 12 prior out-of-fold windows; conservative requires 18. No position carries across window boundaries. Different horizons have different exposure and label counts.')
+    return report
 
 
 def main():
