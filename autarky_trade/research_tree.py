@@ -180,36 +180,103 @@ def validate_proposal(value,available,seen):
     return parent,spec,hypothesis.strip()
 
 
-def propose(model,agent,available,seen,context,reject):
-    # No model output is executed as code; hypotheses are unverified rationale.
+def candidate_menu(agent, available, seen, context, limit=18):
+    """Generate legal one-dimensional children, then diversify the short menu."""
     preferred={'alpha':'ridge_trend_only','beta':'ridge_expanded','gamma':'risk_long'}[agent]
-    if model is None:
-        for name in [preferred]+list(available):
-            p=available[name]
-            for method in METHODS:
+    focus={'alpha':('momentum','distance','rsi','breakout'),
+           'beta':FEATURES,'gamma':('volatility','volume_ratio')}[agent]
+    recent=context.get('recent_nodes',{})
+    legacy=context.get('legacy_measured',{})
+    def score(name):
+        markets=recent.get(name,{}).get('markets',legacy.get(name,{}))
+        return min((m.get('stress',-1.) for m in markets.values()),default=-1.)
+    # Keep the agent's anchor, a measured promising root, and recent children.
+    names=[preferred]+sorted(recent,key=score,reverse=True)+sorted(available,key=score,reverse=True)
+    names=list(dict.fromkeys(n for n in names if n in available))
+    used=set(seen); menus=[]
+    for name in names:
+        p=available[name]; groups=[]
+        def variants(field, values):
+            options=[]
+            for v in values:
                 try:
-                    s=Spec(p.features,method,p.transform,p.calibration)
-                    if s.identity not in seen and s.method!=p.method: return name,s,'Does changing the estimator improve stressed return?'
+                    s=Spec(**{**asdict(p),field:v})
+                    if s.identity in used: continue
+                    used.add(s.identity)
+                    options.append((name,s,field))
                 except ValueError: continue
-        raise ValueError('No deterministic proposals remain')
-    # Bound prompt history, but retain all identities for validation.
-    menu={name:asdict(s) for name,s in available.items() if not name.startswith('node:') or name in context['recent_nodes']}
-    prompt=(f'You are {agent}. Focus: {old.FOCUS[agent]} Propose ONE new matched experiment. '
-            'Change exactly one dimension (feature set, method, transform, calibration) from a named parent. '
-            'All models predict weekly expected return; logistic_up/downside map event probabilities to training conditional means. '
-            'Compare on BTC and ETH; prefer stressed returns, avoid repeat failures. Do not state unmeasured numerical claims. '
-            'Hypothesis is a question, not a result. Output JSON with parent, spec (features as [feature,lookback] pairs, method, transform, calibration), hypothesis. '
-            f'Features {FEATURES}; windows {WINDOWS}; methods {METHODS}; transforms {TRANSFORMS}; calibration {CALIBRATIONS}. '
-            'Available parents: '+old.pack(menu)+' Deterministic evidence: '+old.pack(context))
-    errors=[]
-    for _ in range(3):
+            return options
+        # Generate features from the parent, not a prewritten list of models.
+        fs=p.features; feature_options=[]
+        for k in fs:
+            if len(fs)>1: feature_options.append(tuple(x for x in fs if x!=k))
+        for k in fs:
+            for w in WINDOWS:
+                new=(k[0],w)
+                if new not in fs: feature_options.append(tuple(new if x==k else x for x in fs))
+        if len(fs)<12:
+            for f in focus:
+                for w in (24,72,168,672,6,12,48,120,336,504,720):
+                    if (f,w) not in fs: feature_options.append(fs+((f,w),))
+        groups_by_field={
+            'features':feature_options,
+            'method':[m for m in METHODS if m!=p.method],
+            'transform':[v for v in TRANSFORMS if v!=p.transform],
+            'calibration':[v for v in CALIBRATIONS if v!=p.calibration]}
+        order=('method','features','calibration','transform') if agent=='beta' else ('features','method','calibration','transform')
+        groups=[variants(field,groups_by_field[field]) for field in order]
+        menu=[]
+        for i in range(max(map(len,groups),default=0)):
+            for group in groups:
+                if i<len(group): menu.append(group[i])
+        if menu: menus.append(menu)
+    result=[]
+    # Anchor gets a few diverse choices; other parents, including children,
+    # get a turn before a single parent's many feature edits fill the prompt.
+    for i in range(max(map(len,menus),default=0)):
+        for menu in menus[:6]:
+            if i<len(menu): result.append(menu[i])
+            if len(result)>=limit: return result
+    return result
+
+
+def propose(model,agent,available,seen,context,reject):
+    menu=candidate_menu(agent,available,seen,context)
+    if not menu: raise ValueError('No novel one-dimensional proposals remain')
+    def selected(index,hypothesis,source):
+        parent,s,field=menu[index]
+        return parent,s,hypothesis,source
+    def default(source):
+        parent,s,field=menu[0]
+        return selected(0,f'Does changing {field} from {parent} improve stressed returns on both markets?',source)
+    if model is None: return default('deterministic')
+    choices=[{'choice':i,'parent':p,'change':field,'value':asdict(s)[field]}
+             for i,(p,s,field) in enumerate(menu)]
+    # Include measured evidence only for parents represented in the menu.
+    relevant={p for p,_,_ in menu}
+    evidence={k:v for k,v in context.get('legacy_measured',{}).items() if k in relevant}
+    children={k:v for k,v in context.get('recent_nodes',{}).items() if k in relevant}
+    prompt=(f'You are {agent}. Focus: {old.FOCUS[agent]}. Choose one numbered experiment. '
+            'Every option is already validated and novel. Prefer improvement in stressed returns on both markets; '
+            'negative returns are losses. Return only JSON with choice (integer) and hypothesis (a short question, no claimed results). '
+            'Do not write a full specification. Example: {"choice":0,"hypothesis":"Does this change improve stressed returns?"}. '
+            'Options: '+old.pack(choices)+' Measured parent evidence: '+old.pack({'roots':evidence,'children':children,'parent_specs':{p:asdict(available[p]) for p in sorted(relevant)}}))
+    schema={'type':'object','properties':{'choice':{'type':'integer','minimum':0,'maximum':len(menu)-1},
+            'hypothesis':{'type':'string','maxLength':300}},'required':['choice','hypothesis'],'additionalProperties':False}
+    error='none'
+    for attempt in range(2):
         try:
-            response=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'think':False,'format':'json','messages':[{'role':'user','content':prompt+' Previous rejection: '+(errors[-1] if errors else 'none')}],'options':{'temperature':.2,'num_ctx':8192,'num_predict':1024}})
+            response=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'think':False,'format':schema if attempt==0 else 'json','messages':[{'role':'user','content':prompt+' Previous rejection: '+error}],'options':{'temperature':0,'num_ctx':8192,'num_predict':512}})
             raw=response['message']['content']; value=json.loads(raw)
-            return validate_proposal(value,available,seen)
+            if not isinstance(value,dict) or set(value)!={'choice','hypothesis'}: raise ValueError('Expected choice and hypothesis')
+            index=value['choice']; h=value['hypothesis']
+            if type(index) is not int or not 0<=index<len(menu): raise ValueError('Invalid menu index')
+            if not isinstance(h,str) or not h.strip() or len(h)>300: raise ValueError('Invalid hypothesis')
+            return selected(index,h.strip(),'ollama')
         except (ValueError,TypeError,KeyError) as exc:
-            errors.append(str(exc)[:300]); reject(errors[-1])
-    raise ValueError('No valid novel proposal after three attempts')
+            error=str(exc)[:300]; reject(error)
+    # Explicitly labeled fallback, never claim the model selected this experiment.
+    return default('deterministic_fallback')
 
 
 def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=None):
@@ -223,7 +290,7 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
         with c:
             for table in ('tree_runs','tree_nodes'):
                 c.execute(f"UPDATE {table} SET status='interrupted' WHERE status='running'")
-            record={'protocol':PROTOCOL,'dataset':dataset,'datasets':hashes,'cutoff':cutoff,'model':model,'completed':0,'rejected':0,'legacy_evidence_loaded':bool(seed),'legacy_evidence':seed,'development_only':True,'eligible':False}
+            record={'protocol':PROTOCOL,'dataset':dataset,'datasets':hashes,'cutoff':cutoff,'model':model,'completed':0,'rejected':0,'fallbacks':0,'legacy_evidence_loaded':bool(seed),'legacy_evidence':seed,'development_only':True,'eligible':False}
             rid=c.execute('INSERT INTO tree_runs(dataset,status,report) VALUES(?,?,?)',(dataset,'running',old.pack(record))).lastrowid
         record['run_id']=rid; state='complete'
         try:
@@ -239,14 +306,16 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
                         def reject(reason):
                             with c: c.execute('INSERT INTO tree_rejections(run,agent,reason) VALUES(?,?,?)',(rid,agent,reason))
                             record['rejected']+=1; emit({'event':'rejected','agent':agent,'reason':reason})
-                        try: parent,spec,hypothesis=propose(model,agent,available,seen,context,reject)
+                        try: parent,spec,hypothesis,source=propose(model,agent,available,seen,context,reject)
                         except ValueError as exc:
                             emit({'event':'no_proposal','agent':agent,'reason':str(exc)}); continue
-                        r={'spec':asdict(spec),'parent_spec':asdict(available[parent]),'hypothesis_unverified':hypothesis,'development_only':True,'eligible':False}
+                        if source=='deterministic_fallback':
+                            record['fallbacks']+=1; emit({'event':'fallback','agent':agent,'reason':'Invalid Ollama choices; using validated deterministic candidate'})
+                        r={'proposal_source':source,'spec':asdict(spec),'parent_spec':asdict(available[parent]),'hypothesis_unverified':hypothesis,'development_only':True,'eligible':False}
                         with c:
                             eid=c.execute('INSERT INTO tree_nodes(run,dataset,identity,parent,agent,status,report) VALUES(?,?,?,?,?,?,?)',(rid,dataset,spec.identity,parent,agent,'running',old.pack(r))).lastrowid
                         try:
-                            emit({'event':'start','id':eid,'agent':agent,'parent':parent,'spec':asdict(spec)})
+                            emit({'event':'start','id':eid,'agent':agent,'parent':parent,'spec':asdict(spec),'proposal_source':source})
                             reports={p:evaluate(parts[p],p,cutoff,available[parent],spec) for p in old.PAIRS}
                             r.update(findings=facts(reports),results=reports)
                             with c:

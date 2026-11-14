@@ -50,16 +50,40 @@ class TreeTests(unittest.TestCase):
             path=Path(d)/'tree.sqlite'; events=[]
             a=t.run(path,parts,cutoff,model=None,emit=events.append)
             self.assertEqual(a['completed'],3)
-            first=t.status(path)['nodes'][-1]; s=t.Spec(**first['spec']); child=t.Spec(s.features,s.method,s.transform,'conservative')
-            response={'parent':'node:'+str(first['id']),'spec':t.asdict(child),'hypothesis':'Does stricter calibration help?'}
-            with patch.object(t,'request',return_value={'message':{'content':json.dumps(response)}}):
+            first=t.status(path)['nodes'][-1]
+            target='node:'+str(first['id'])
+            def choose_child(url,payload):
+                prompt=payload['messages'][0]['content']
+                options=json.loads(prompt.split('Options: ',1)[1].split(' Measured parent evidence:',1)[0])
+                choice=next((x['choice'] for x in options if x['parent']==target),0)
+                return {'message':{'content':json.dumps({'choice':choice,'hypothesis':'Does this change help?'})}}
+            with patch.object(t,'request',side_effect=choose_child):
                 a=t.run(path,parts,cutoff,model='qwen3:4b',emit=events.append)
-            self.assertEqual(a['completed'],1); self.assertEqual(a['rejected'],6)
-            data=t.status(path); self.assertEqual(len(data['nodes']),4)
-            self.assertEqual(data['nodes'][0]['parent'],response['parent'])
+            self.assertEqual(a['completed'],3); self.assertEqual(a['rejected'],0)
+            data=t.status(path); self.assertEqual(len(data['nodes']),6)
+            self.assertTrue(any(n['parent']==target for n in data['nodes']))
+            self.assertTrue(all(n['proposal_source']=='ollama' for n in data['nodes'][:3]))
             self.assertFalse(data['nodes'][0]['findings']['eligible'])
             data['nodes'][0]['hypothesis_unverified']='<script>bad</script>'
             self.assertNotIn('<script>bad</script>',t.render(data))
+
+    def test_dynamic_menu_and_invalid_choice_fallback(self):
+        available=t.roots(); seen={s.identity for s in available.values()}
+        for agent in old.AGENTS:
+            for _ in range(5):
+                menu=t.candidate_menu(agent,available,seen,{})
+                self.assertTrue(menu)
+                self.assertEqual(len({s.identity for _,s,_ in menu}),len(menu))
+                for parent,s,field in menu:
+                    self.assertNotIn(s.identity,seen)
+                    self.assertEqual([k for k in ('features','method','transform','calibration') if getattr(s,k)!=getattr(available[parent],k)],[field])
+                parent,s,_,source=t.propose(None,agent,available,seen,{},lambda _:None)
+                self.assertEqual(source,'deterministic'); seen.add(s.identity)
+        errors=[]
+        with patch.object(t,'request',return_value={'message':{'content':'{"choice":999,"hypothesis":"bad"}'}}):
+            parent,s,h,source=t.propose('qwen3:4b','gamma',available,seen,{},errors.append)
+        self.assertEqual(source,'deterministic_fallback'); self.assertEqual(len(errors),2)
+        self.assertNotIn(s.identity,seen)
 
     def test_legacy_and_parent_equivalence(self):
         b=synthetic(721+720*9); cutoff=b[-1].ts; parts={'XBTUSD':[b],'ETHUSD':[b]}
