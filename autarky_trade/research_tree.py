@@ -279,7 +279,8 @@ def propose(model,agent,available,seen,context,reject):
     children={k:v for k,v in context.get('recent_nodes',{}).items() if k in relevant}
     sources={k:v for k,v in context.get('source_nodes',{}).items() if k in relevant}
     prompt=(f'You are {agent}. Focus: {old.FOCUS[agent]}. Choose one numbered experiment. '
-            'Every option is already validated and novel. Prefer improvement in stressed returns on both markets; '
+            'Every option is already validated and novel. '
+            + (f'Prioritize stressed returns on {context["target_market"]}; report the other market as a robustness check. ' if context.get('target_market') else 'Prefer improvement in stressed returns on both markets; ') +
             'negative returns are losses. Return only JSON with choice (integer) and hypothesis (a short question, no claimed results). '
             'Do not write a full specification. Example: {"choice":0,"hypothesis":"Does this change improve stressed returns?"}. '
             + (f'Forecast horizon: {context["horizon_hours"]} hours. Legacy weekly evidence is contextual only. ' if context.get('horizon_hours') else '') + ('Cross-market mode: parent evidence from legacy single-market windows is contextual only; compare measured aligned results. ' if context.get('cross_asset') else '')+'Options: '+old.pack(choices)+' Measured parent evidence: '+old.pack({'roots':evidence,'children':children,'source_weekly_context_only':sources,'parent_specs':{p:asdict(available[p]) for p in sorted(relevant)}}))
@@ -301,7 +302,12 @@ def propose(model,agent,available,seen,context,reject):
     return default('deterministic_fallback')
 
 
-def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=None,*,cross_asset=False,horizon=None):
+def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=None,*,cross_asset=False,horizon=None,agents=None,parent_name=None,allocation=None):
+    agents=tuple(old.AGENTS if agents is None else agents)
+    if not agents or len(set(agents))!=len(agents) or any(a not in old.AGENTS for a in agents):
+        raise ValueError('Require distinct known agents')
+    if allocation is not None and (not cross_asset or horizon is None or not parent_name or allocation.get('target_market') not in old.PAIRS):
+        raise ValueError('Allocation requires aligned explicit horizon and target market')
     if horizon is not None: wm.horizon_slots(horizon)
     if set(parts)!=set(old.PAIRS) or type(rounds) is not int or not 1<=rounds<=20 or type(budget) is not int or not 1<=budget<=3:
         raise ValueError('Both markets required; rounds 1..20, budget 1..3 per agent')
@@ -326,14 +332,18 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
                 record.update(research_mode=cross.PROTOCOL,source_datasets=original_hashes,aligned_bars=sum(map(len,parts['XBTUSD'])),aligned_segments=len(parts['XBTUSD']),legacy_evidence_context_only=True)
             if horizon is not None:
                 record.update(research_mode=wm.HORIZON_PROTOCOL,horizon_hours=horizon,source_weekly_dataset=source_dataset,legacy_evidence_context_only=True)
+            if allocation is not None: record['allocation']=allocation
             rid=c.execute('INSERT INTO tree_runs(dataset,status,report) VALUES(?,?,?)',(dataset,'running',old.pack(record))).lastrowid
         record['run_id']=rid; state='complete'
         try:
             for _ in range(rounds):
-                for agent in old.AGENTS:
+                for agent in agents:
                     for _ in range(budget):
                         available=parents(c,dataset,source_dataset)
                         seen={s.identity for s in available.values()}|{r[0] for r in c.execute('SELECT identity FROM tree_nodes WHERE dataset=?',(dataset,))}
+                        if parent_name is not None:
+                            if parent_name not in available: raise ValueError('Unknown allocated parent')
+                            available={parent_name:available[parent_name]}
                         recent={}
                         for row in c.execute("SELECT id,report FROM tree_nodes WHERE dataset=? AND status='complete' ORDER BY id DESC LIMIT 6",(dataset,)):
                             r=json.loads(row['report']); f=r['findings']; recent['node:'+str(row['id'])]={'classification':f['classification'],'markets':{p:{k:m[k] for k in ('net','stress','vs_parent','vs_mean','fills')} for p,m in f['markets'].items()}}
@@ -342,6 +352,10 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
                             for row in c.execute("SELECT id,report FROM tree_nodes WHERE dataset=? AND status='complete' ORDER BY id DESC LIMIT 12",(source_dataset,)):
                                 r=json.loads(row['report']); f=r['findings']; sources['node:'+str(row['id'])]={'classification':f['classification'],'markets':{p:{k:m[k] for k in ('net','stress','vs_parent','vs_mean','fills')} for p,m in f['markets'].items()}}
                         context={'source_nodes':sources,'horizon_hours':horizon,'cross_asset':cross_asset,'legacy_measured':seed,'recent_nodes':recent,'warning':'Development only; no promotion. Net/stress are fractional returns. Negative is a loss.'}
+                        if allocation is not None:
+                            context['target_market']=allocation['target_market']
+                            # Same-horizon evidence supplied by the allocator, not legacy weekly metrics.
+                            context['recent_nodes'][parent_name]=allocation['parent_evidence']
                         def reject(reason):
                             with c: c.execute('INSERT INTO tree_rejections(run,agent,reason) VALUES(?,?,?)',(rid,agent,reason))
                             record['rejected']+=1; emit({'event':'rejected','agent':agent,'reason':reason})
@@ -351,6 +365,7 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
                         if source=='deterministic_fallback':
                             record['fallbacks']+=1; emit({'event':'fallback','agent':agent,'reason':'Invalid Ollama choices; using validated deterministic candidate'})
                         r={'research_mode':cross.PROTOCOL if cross_asset else 'single_asset','proposal_source':source,'spec':asdict(spec),'parent_spec':asdict(available[parent]),'hypothesis_unverified':hypothesis,'development_only':True,'eligible':False}
+                        if allocation is not None: r['allocation']=allocation
                         if horizon is not None:
                             r.update(research_mode=wm.HORIZON_PROTOCOL,horizon_hours=horizon,cross_asset=cross_asset)
                         with c:
@@ -370,7 +385,7 @@ def run(path,parts,cutoff,legacy=None,model='qwen3:4b',rounds=1,budget=1,emit=No
         except BaseException as exc:
             state='interrupted' if isinstance(exc,KeyboardInterrupt) else 'failed'; record['error']=str(exc); raise
         finally:
-            if state=='complete' and record['completed']<rounds*budget*len(old.AGENTS):
+            if state=='complete' and record['completed']<rounds*budget*len(agents):
                 state='partial' if record['completed'] else 'no_valid_proposals'
             record['status']=state
             with c: c.execute('UPDATE tree_runs SET status=?,report=? WHERE id=?',(state,old.pack(record),rid))
