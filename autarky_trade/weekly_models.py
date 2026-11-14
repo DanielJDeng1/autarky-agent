@@ -38,9 +38,10 @@ def fit(rows, spec):
     return lambda x: mu+sum(w*(x[k]-m)/s for w,k,m,s in zip(weights,spec,means,scales))
 
 
-def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None):
+def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator=None):
     specs = SPECS if specs is None else specs
     fitter = (lambda name, rows, spec: fit(rows, spec)) if fitter is None else fitter
+    calibrator = (lambda name, rows: fa.calibrate(rows)) if calibrator is None else calibrator
     if not specs or len(specs) > 16:
         raise ValueError("Require 1..16 model specifications")
     now = int(time.time()) if now is None else now
@@ -71,7 +72,7 @@ def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None):
                         'train_count':len(past),'train_last_label_end':past[-1]['label_end'],'models':{}}
                 for name,spec in specs.items():
                     prior=[r for r in history[name] if r['label_end']<ts][-LOOKBACK:]
-                    threshold=fa.calibrate(prior)
+                    threshold=calibrator(name,prior)
                     predict=fitter(name,past,spec)
                     samples=[{k:r[k] for k in ('start','label_end','realized')} | {'prediction':predict(r['features'])} for r in rows]
                     picked={i for i,r in enumerate(samples) if threshold is not None and r['prediction']>threshold}
