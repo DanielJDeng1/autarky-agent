@@ -38,7 +38,7 @@ def fit(rows, spec):
     return lambda x: mu+sum(w*(x[k]-m)/s for w,k,m,s in zip(weights,spec,means,scales))
 
 
-def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator=None):
+def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator=None, feature_provider=None):
     specs = SPECS if specs is None else specs
     fitter = (lambda name, rows, spec: fit(rows, spec)) if fitter is None else fitter
     calibrator = (lambda name, rows: fa.calibrate(rows)) if calibrator is None else calibrator
@@ -57,13 +57,23 @@ def review(parts, pair, cutoff, now=None, *, specs=None, fitter=None, calibrator
     for bars in parts:
         if len(bars)<lab.WARMUP+720:
             continue
-        f=lab.Features(bars); series={k:f.series(*k) for k in keys}
+        f=lab.Features(bars)
+        series={}
+        for k in keys:
+            if k[0] in lab.FEATURES and k[0]!='forecast':
+                series[k]=f.series(*k)
+            elif feature_provider is not None:
+                series[k]=feature_provider(bars,k)
+                if len(series[k])!=len(bars): raise ValueError('Invalid external feature length')
+            else: raise ValueError('External feature requires aligned market data')
         for start in range(lab.WARMUP,len(bars)-719,720):
             ts=bars[start].ts; end=start+720
             past=[r for r in training if r['label_end']<ts][-LOOKBACK:]
             rows=[]
             for i in range(start,end-168,168):
                 # A missing volume ratio (zero preceding volume) is neutral at one.
+                if any(series[k][i] is None for k in keys if k[0] not in lab.FEATURES):
+                    raise ValueError('Missing aligned external feature at decision')
                 x={k:series[k][i] if series[k][i] is not None else 1.0 for k in keys}
                 rows.append({'start':bars[i].ts,'label_end':bars[i+168].ts,
                              'realized':bars[i+168].open/bars[i].open-1,'features':x})
