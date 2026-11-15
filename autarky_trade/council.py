@@ -2,7 +2,7 @@
 Local Ollama reasoning is recorded only when the model explicitly returns it. No live orders.
 """
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager, ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
@@ -21,8 +21,8 @@ from . import economic_kernel as economy
 PROTOCOL='v0.26-council-1'
 SLOTS=economy.SLOTS
 PAIRS=('XBTUSD','ETHUSD')
-ACTIONS=('talk','conserve','directional','funding_tail','carry_screen','request_capability','delegate','accept_task','decline_task','review','deploy_paper','stop_paper','create_project','project_update','verify')
-PAID=('directional','funding_tail','carry_screen','verify')
+ACTIONS=('talk','conserve','directional','funding_tail','carry_screen','request_capability','delegate','accept_task','decline_task','review','deploy_paper','stop_paper','create_project','project_update','verify','hedged_carry')
+PAID=('directional','funding_tail','carry_screen','verify','hedged_carry')
 
 
 def pack(x): return json.dumps(x,sort_keys=True,separators=(',',':'),allow_nan=False)
@@ -37,7 +37,7 @@ def connect(path, create=False):
     try:
         with c:
             tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-            if tables-{'council_config','council_messages','council_turns','council_experiments','council_assignments','runtime_state','runtime_events','runtime_candidates','council_projects','council_project_updates'}: raise ValueError('Use a separate council database')
+            if tables-{'council_config','council_messages','council_turns','council_experiments','council_assignments','runtime_state','runtime_events','runtime_candidates','council_projects','council_project_updates','runtime_equity_history','council_deliveries','council_delivery_baseline'}: raise ValueError('Use a separate council database')
             if create:
                 c.executescript('''CREATE TABLE IF NOT EXISTS council_config(protocol TEXT NOT NULL, economy_path TEXT);
                 CREATE TABLE IF NOT EXISTS council_messages(id INTEGER PRIMARY KEY, created INTEGER NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL);
@@ -47,6 +47,10 @@ def connect(path, create=False):
                 CREATE TABLE IF NOT EXISTS council_project_updates(id INTEGER PRIMARY KEY, project INTEGER NOT NULL, agent TEXT NOT NULL, created INTEGER NOT NULL, body TEXT NOT NULL, evidence TEXT);
                 CREATE TABLE IF NOT EXISTS council_experiments(key TEXT PRIMARY KEY, agent TEXT NOT NULL, turn INTEGER NOT NULL, task TEXT NOT NULL UNIQUE, state TEXT NOT NULL, result TEXT NOT NULL);''')
                 if not c.execute('SELECT 1 FROM council_config').fetchone(): c.execute('INSERT INTO council_config(protocol) VALUES(?)',(PROTOCOL,))
+            if create and 'council_deliveries' not in tables:
+                c.execute('CREATE TABLE council_deliveries(agent TEXT NOT NULL,message INTEGER NOT NULL,turn INTEGER NOT NULL,PRIMARY KEY(agent,message))')
+                c.execute('CREATE TABLE council_delivery_baseline(agent TEXT PRIMARY KEY,through INTEGER NOT NULL)')
+                c.execute('INSERT INTO council_delivery_baseline SELECT agent,max(inbox_through) FROM council_turns GROUP BY agent')
             if create and 'project_id' not in {r[1] for r in c.execute('PRAGMA table_info(council_assignments)')}: c.execute('ALTER TABLE council_assignments ADD COLUMN project_id INTEGER')
             if c.execute('SELECT protocol FROM council_config').fetchone()[0]!=PROTOCOL: raise ValueError('Wrong council protocol')
     except BaseException: c.close(); raise
@@ -66,21 +70,28 @@ def send(path,recipient,body):
     with closing(connect(path)) as c,c: return message(c,'operator',recipient,'operator',body)
 
 
-def inbox(c,agent):
+def unread_messages(c,agent,kind,limit=4):
     slot=agent.split(':')[0]
+    if economy.table_exists(c,'council_deliveries'):
+        baseline=c.execute('SELECT through FROM council_delivery_baseline WHERE agent=?',(agent,)).fetchone()
+        through=baseline[0] if baseline else 0
+        delivery='AND NOT EXISTS (SELECT 1 FROM council_deliveries d WHERE d.agent=? AND d.message=m.id)'
+        args=[through,agent]
+    else:
+        through=c.execute('SELECT coalesce(max(inbox_through),0) FROM council_turns WHERE agent=?',(agent,)).fetchone()[0]
+        delivery=''; args=[through]
+    if kind=='operator': condition="sender='operator' AND kind='operator' AND recipient IN ('all',?,?)"; args.extend((slot,agent))
+    else: condition="sender NOT IN ('operator','system',?) AND recipient IN (?,?)"; args.extend((agent,slot,agent))
+    return [dict(r) for r in c.execute('SELECT m.* FROM council_messages m WHERE m.id>? '+delivery+' AND '+condition+' ORDER BY m.id LIMIT ?',(*args,limit))]
+
+
+def inbox(c,agent):
+    slot=agent.split(':')[0]; unread=unread_messages(c,agent,'operator'); peers=unread_messages(c,agent,'peer')
     through=c.execute('SELECT coalesce(max(inbox_through),0) FROM council_turns WHERE agent=?',(agent,)).fetchone()[0]
-    # Snapshot the upper bound before reading; concurrent messages remain unread.
-    high=c.execute('SELECT coalesce(max(id),0) FROM council_messages').fetchone()[0]
-    # Never skip unread addressed operator messages: consume the earliest batch first.
-    unread=[dict(r) for r in c.execute("SELECT * FROM council_messages WHERE id>? AND id<=? AND sender='operator' AND kind='operator' AND recipient IN ('all',?,?) ORDER BY id LIMIT 4",(through,high,slot,agent))]
-    recent=[dict(r) for r in c.execute("SELECT * FROM council_messages WHERE recipient IN ('all',?,?) OR sender=? ORDER BY id DESC LIMIT 30",(slot,agent,agent))]
-    cap=unread[-1]['id'] if len(unread)==4 else high
-    peers=[dict(r) for r in c.execute("SELECT * FROM council_messages WHERE id>? AND id<=? AND sender NOT IN ('operator','system',?) AND recipient IN (?,?) ORDER BY id LIMIT 4",(through,cap,agent,slot,agent))]
-    if len(peers)==4: cap=min(cap,peers[-1]['id'])
-    unread=[r for r in unread if r['id']<=cap]
-    peers=[r for r in peers if r['id']<=cap]
-    # Recent context must not disclose future operator instructions beyond the acknowledged batch.
-    recent=[r for r in recent if r['id']<=cap]
+    # Preserve addressed batches independently: a newer operator message must not consume an older peer request.
+    cap=max([through]+[r['id'] for r in unread+peers]); recent=[dict(r) for r in c.execute("SELECT * FROM council_messages WHERE recipient IN ('all',?,?) OR sender=? ORDER BY id DESC LIMIT 30",(slot,agent,agent))]
+    # Don't expose unread messages beyond the selected batch to the model.
+    selected={r['id'] for r in unread+peers}; recent=[r for r in recent if r['id']<=cap or r['sender']==agent or r['recipient']=='all' and r['sender']!='operator']
     return sorted({r['id']:r for r in recent+unread+peers}.values(),key=lambda r:r['id']),cap,unread
 
 
@@ -97,6 +108,8 @@ def validate_plan(raw):
         wm.horizon_slots(p['horizon']); p=dict(p,spec=asdict(tree.Spec(**p['spec'])))
     elif a=='funding_tail':
         if set(p)!= {'pair','horizon','rule'} or p['pair'] not in PAIRS or type(p['horizon']) is not int or p['horizon'] not in (168,336) or p['rule'] not in ('low_level','high_level','falling_funding','rising_funding'): raise ValueError('Invalid funding-tail parameters')
+    elif a=='hedged_carry':
+        if set(p)!= {'pair','months'} or p['pair'] not in PAIRS or type(p['months']) is not int or p['months'] not in (3,6,12): raise ValueError('Hedged carry requires pair and 3, 6 or 12 months')
     elif a=='carry_screen':
         if set(p)!= {'pair'} or p['pair'] not in PAIRS: raise ValueError('Invalid carry screen pair')
     elif a=='request_capability':
@@ -156,9 +169,13 @@ def carry_screen(dataset,pair,cutoff):
     return {'development_only':True,'eligible':False,'mechanism':'constant notional short perpetual funding receipt; hypothetical long spot hedge not simulated','months':len(result),'mean_gross':sum(r['gross_short_perp_funding_per_notional'] for r in result)/len(result),'positive_after_1pct_months':sum(r['illustrative_net_after_1pct_round_trip']>0 for r in result),'monthly':result,'limitations':'Funding cash flows only. Not a tradeable return: excludes changing notional, hedge P&L, basis, margin, liquidation, borrow, availability, taxes and actual fees. No eligibility.'}
 
 
-def research(plan,parts,funding,cutoff,capture=None):
+def research(plan,parts,funding,cutoff,capture=None,cache=None):
     a,p=plan['action'],plan['parameters']
     if a=='carry_screen': return carry_screen(funding,p['pair'],cutoff)
+    if a=='hedged_carry':
+        if cache is None: raise ValueError('Hedged carry requires runtime archive cache')
+        from . import mechanisms
+        return mechanisms.review(cache,funding,p['pair'],cutoff,p['months'])
     if a=='funding_tail':
         from . import funding_state
         r=funding_state.review(parts,funding,cutoff,(p['horizon'],))
@@ -171,20 +188,34 @@ def research(plan,parts,funding,cutoff,capture=None):
     return {'summary':r['summary'],'windows':r['windows'],'dataset_sha256':r['dataset_sha256'],'other_dataset_sha256':r['other_dataset_sha256'],'development_only':True,'eligible':False}
 
 
+@contextmanager
+def economic_lock(path,timeout=15):
+    from .coordinator import exclusive
+    until=time.monotonic()+timeout
+    with ExitStack() as stack:
+        while True:
+            try: stack.enter_context(exclusive(str(Path(path).resolve())+'.lock')); break
+            except RuntimeError:
+                if time.monotonic()>=until: raise
+                time.sleep(.05)
+        yield
+
+
 def paid_task(path,ident,plan,worker,task):
     """Use v0.24 journal and lifecycle. Prepay in a committed transaction before work."""
     from .coordinator import exclusive
-    with exclusive(str(Path(path).resolve())+'.lock'),closing(economy.connect(path)) as c:
-        cfg=json.loads(c.execute('SELECT config FROM economy_config').fetchone()[0])
-        with c:
-            economy.recover(c)
-            a=c.execute('SELECT * FROM economy_agents WHERE id=?',(ident,)).fetchone()
-            if not a or a['state']!='active' or economy.balance(c,ident+':operating')<cfg['research_cents']+(0 if economy.table_exists(c,'economy_clock') else cfg['upkeep_cents']): raise ValueError('Agent cannot afford research or is conserving/retired')
-            tick=c.execute("INSERT INTO economy_ticks(status,decision) VALUES('running','council_research')").lastrowid
-            if not economy.table_exists(c,'economy_clock'): economy.upkeep(c,cfg,tick)
-            economy.transfer(c,tick,ident+':operating','spent',cfg['research_cents'],'research',task)
-            payload={'council_plan':plan,'source':'council'}
-            c.execute('INSERT INTO economy_tasks VALUES(?,?,?,?,?,?)',(task,tick,ident,'running',cfg['research_cents'],pack(payload)))
+    with exclusive(str(Path(path).resolve())+'.research.lock'):
+        with economic_lock(path),closing(economy.connect(path)) as c:
+            cfg=json.loads(c.execute('SELECT config FROM economy_config').fetchone()[0])
+            with c:
+                economy.recover(c)
+                a=c.execute('SELECT * FROM economy_agents WHERE id=?',(ident,)).fetchone()
+                if not a or a['state']!='active' or economy.balance(c,ident+':operating')<cfg['research_cents']+(0 if economy.table_exists(c,'economy_clock') else cfg['upkeep_cents']): raise ValueError('Agent cannot afford research or is conserving/retired')
+                tick=c.execute("INSERT INTO economy_ticks(status,decision) VALUES('running','council_research')").lastrowid
+                if not economy.table_exists(c,'economy_clock'): economy.upkeep(c,cfg,tick)
+                economy.transfer(c,tick,ident+':operating','spent',cfg['research_cents'],'research',task)
+                payload={'council_plan':plan,'source':'council'}
+                c.execute('INSERT INTO economy_tasks VALUES(?,?,?,?,?,?)',(task,tick,ident,'running',cfg['research_cents'],pack(payload)))
         start=time.monotonic(); cpu=time.process_time(); error=None
         try: result=worker()
         except BaseException as exc: error=exc; result={'error':str(exc)}
@@ -194,10 +225,12 @@ def paid_task(path,ident,plan,worker,task):
         improved=bool(candidate and candidate['mean_stress']>0 and candidate['fills']>=10 and candidate['active_windows']>=5 and candidate['mean_stress']>max(m['parent']['mean_stress'],m['mean']['mean_stress']))
         payload.update(result=result,improved_research=improved,wall_seconds=time.monotonic()-start,python_cpu_seconds=time.process_time()-cpu)
         state='interrupted' if isinstance(error,KeyboardInterrupt) else 'failed' if error else 'complete'
-        with c:
+        with economic_lock(path),closing(economy.connect(path)) as c,c:
             c.execute('UPDATE economy_tasks SET state=?,report=? WHERE id=?',(state,pack(payload),task)); c.execute('UPDATE economy_ticks SET status=? WHERE id=?',(state,tick))
             # Non-directional diagnostic tools are not comparable to the old forecast score.
-            if plan['action']=='directional' or error: economy.record_failure(c,cfg,ident,tick,improved)
+            if plan['action']=='directional' or error:
+                agent_state=c.execute('SELECT state FROM economy_agents WHERE id=?',(ident,)).fetchone()[0]
+                if agent_state not in ('retired','liquidating'): economy.record_failure(c,cfg,ident,max(tick,c.execute('SELECT coalesce(max(id),0) FROM economy_ticks').fetchone()[0]),improved)
         if isinstance(error,KeyboardInterrupt): raise error
         return state,payload
 
@@ -214,19 +247,21 @@ def recover_experiments(c,economy_path):
             c.execute('UPDATE council_experiments SET state=?,result=? WHERE key=?',(state,pack(result),r['key']))
 
 
-def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,provider=local_model,activity=None,paid_gate=None):
+def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,provider=local_model,activity=None,paid_gate=None,dispatch=None,on_complete=None):
     from .coordinator import exclusive
     with exclusive(str(Path(path).resolve())+'.turn.lock'),closing(connect(path)) as c:
         with c:
             linked=c.execute('SELECT economy_path FROM council_config').fetchone()[0]; resolved=str(Path(economy_path).resolve())
             if linked and linked!=resolved: raise ValueError('Council is bound to a different economic ledger')
             c.execute('UPDATE council_config SET economy_path=?',(resolved,))
-            recover_experiments(c,economy_path)
-        messages,through,unread=inbox(c,agent['id']); evidence=[dict(r) for r in c.execute('SELECT key,agent,state,result FROM council_experiments ORDER BY rowid DESC LIMIT 6')]
+            if dispatch is None: recover_experiments(c,economy_path)
+        messages,through,unread=inbox(c,agent['id']); peers=unread_messages(c,agent['id'],'peer'); evidence=[dict(r) for r in c.execute('SELECT key,agent,state,result FROM council_experiments ORDER BY rowid DESC LIMIT 6')]
         # Avoid sending long monthly arrays / full reports to local model.
         for e in evidence:
-            x=json.loads(e['result']); r=x.get('result',x); e['result']={k:v for k,v in r.items() if k!='monthly'}
-        prompt=pack({'identity':agent['id'],'predecessor':agent.get('predecessor'),'policy':agent['policy'],'operating_cents':agent['operating_cents'],'state':agent['state'],'objective':'When operator messages are unread, answer their questions directly in your message and address operator unless delegating. Find economically viable trading mechanisms. Historical improvements are not revenue. Prefer no trade over losing trade. Answer operator questions directly and share useful evidence. Do not repeat known experiments unless a distinct question requires it. Request missing capabilities instead of claiming execution.','tools':{'talk':{},'conserve':{},'directional':{'pair':list(PAIRS),'horizon':[24,72,168,336],'spec':{'features':[['momentum',168]],'method':'ridge','transform':'raw','calibration':'standard'},'note':'Any valid research-tree Spec, no menu/parent mutation requirement. Features: momentum,distance,volatility,rsi,volume_ratio,breakout,other_momentum,other_volatility,relative_strength,cross_correlation. Methods: ridge,shrink,robust,similarity,regime,logistic_up,logistic_downside. Lookbacks: 6,12,24,48,72,120,168,336,504,672,720.'},'funding_tail':{'pair':list(PAIRS),'horizon':[168,336],'rule':['low_level','high_level','falling_funding','rising_funding']},'carry_screen':{'pair':list(PAIRS)},'request_capability':{'capability':'what new mechanism/data/tool','evidence_needed':'how to test it'}},'collaboration_tools':{'delegate':{'recipient':'specific peer','parameters':{'action':'directional/funding_tail/carry_screen/review','parameters':{},'question':'concrete requested work','project_id':'optional integer'}},'accept_task':{'task_id':'integer'},'decline_task':{'task_id':'integer'},'review':{'experiment_key':'64-char stored key'},'verify':{'experiment_key':'64-char peer experiment; paid deterministic rerun on same data'},'create_project':{'title':'short title','hypothesis':'testable economic hypothesis'},'project_update':{'project_id':'integer','update':'findings or next step','state':'open/complete/abandoned (owner closes)','experiment_key':None},'deploy_paper':{'experiment_key':'qualified own experiment key; runtime only; no live orders'},'stop_paper':{'trial_id':'own active trial id; permanently stop and flatten at fresh quote; runtime only'}},'paid_allowed':allow_paid,'context':context,'recent_messages':[{**r,'body':r['body'][:800]} for r in messages[-12:] if r['id'] not in {u['id'] for u in unread}],'unread_operator_messages':unread,'unread_peer_messages':[r for r in messages if r['id']>c.execute('SELECT coalesce(max(inbox_through),0) FROM council_turns WHERE agent=?',(agent['id'],)).fetchone()[0] and r['sender'] not in ('operator','system',agent['id']) and r['recipient'] in (agent['slot'],agent['id'])][:4],'recent_experiments':evidence,'return_schema':{'action':'one tool name','recipient':'all/operator/alpha/beta/gamma or generation','message':'public response or finding','rationale':'concise decision summary, distinguish assumptions','parameters':{} }})
+            x=json.loads(e['result']); r=x.get('result',x); e['result']={k:v for k,v in r.items() if k not in ('monthly','sources')}
+        prompt=pack({'identity':agent['id'],'predecessor':agent.get('predecessor'),'policy':agent['policy'],'operating_cents':agent['operating_cents'],'state':agent['state'],'objective':'When operator messages are unread, answer their questions directly in your message and address operator unless delegating. Find economically viable trading mechanisms. Historical improvements are not revenue. Prefer no trade over losing trade. Answer operator questions directly and share useful evidence. Do not repeat known experiments unless a distinct question requires it. Request missing capabilities instead of claiming execution.','tools':{'talk':{},'conserve':{},'directional':{'pair':list(PAIRS),'horizon':[24,72,168,336],'spec':{'features':[['momentum',168]],'method':'ridge','transform':'raw','calibration':'standard'},'note':'Any valid research-tree Spec, no menu/parent mutation requirement. Features: momentum,distance,volatility,rsi,volume_ratio,breakout,other_momentum,other_volatility,relative_strength,cross_correlation. Methods: ridge,shrink,robust,similarity,regime,logistic_up,logistic_downside. Lookbacks: 6,12,24,48,72,120,168,336,504,672,720.'},'funding_tail':{'pair':list(PAIRS),'horizon':[168,336],'rule':['low_level','high_level','falling_funding','rising_funding']},'carry_screen':{'pair':list(PAIRS)},'hedged_carry':{'pair':list(PAIRS),'months':[3,6,12],'note':'runtime only; checksum-verified same-venue spot and perpetual archives; equal-base hedge, funding, costs and margin proxy; not live eligibility'},'request_capability':{'capability':'what new mechanism/data/tool','evidence_needed':'how to test it'}},'collaboration_tools':{'delegate':{'recipient':'specific peer','parameters':{'action':'directional/funding_tail/carry_screen/hedged_carry/review','parameters':{},'question':'concrete requested work','project_id':'optional integer'}},'accept_task':{'task_id':'integer'},'decline_task':{'task_id':'integer'},'review':{'experiment_key':'64-char stored key'},'verify':{'experiment_key':'64-char peer experiment; paid deterministic rerun on same data'},'create_project':{'title':'short title','hypothesis':'testable economic hypothesis'},'project_update':{'project_id':'integer','update':'findings or next step','state':'open/complete/abandoned (owner closes)','experiment_key':None},'deploy_paper':{'experiment_key':'qualified own experiment key; runtime only; no live orders'},'stop_paper':{'trial_id':'own active trial id; permanently stop and flatten at fresh quote; runtime only'}},'paid_allowed':allow_paid,'context':context,'recent_messages':[{**r,'body':r['body'][:800]} for r in messages[-12:] if r['id'] not in {u['id'] for u in unread}],'unread_operator_messages':unread,'unread_peer_messages':peers,'recent_experiments':evidence,'return_schema':{'action':'one tool name','recipient':'all/operator/alpha/beta/gamma or generation','message':'public response or finding','rationale':'concise decision summary, distinguish assumptions','parameters':{} }})
+        if unread and context.get('dialogue_enabled'):
+            prompt=pack({**json.loads(prompt),'operator_priority':'Answer each unread operator message directly in one reply. Use action talk, recipient operator, parameters {}. Do not initiate an experiment in this turn. If information is missing, say so.'})
         started=time.monotonic(); cpu=time.process_time()
         if activity: activity('thinking')
         if agent['policy']=='deterministic' and not (context.get('dialogue_enabled') and (unread or any(r['recipient'] in (agent['id'],agent['slot']) and r['sender'] not in ('operator','system',agent['id']) for r in messages))):
@@ -234,7 +269,10 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
         else:
             raw,thought=provider(model,prompt); source='ollama_dialogue' if agent['policy']=='deterministic' else 'ollama'
         wall=time.monotonic()-started; cpu=time.process_time()-cpu
-        try: plan=validate_plan(raw)
+        try:
+            plan=validate_plan(raw)
+            if unread and context.get('dialogue_enabled') and (plan['action']!='talk' or plan['recipient']!='operator'):
+                raise ValueError('Operator reply must use talk addressed to operator; message stays unread')
         except (ValueError,TypeError,KeyError) as exc:
             with c:
                 prev=c.execute('SELECT coalesce(max(inbox_through),0) FROM council_turns WHERE agent=?',(agent['id'],)).fetchone()[0]
@@ -244,6 +282,9 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
         with c:
             tid=c.execute('INSERT INTO council_turns(agent,created,inbox_through,plan,reasoning,source,wall_seconds,python_cpu_seconds) VALUES(?,?,?,?,?,?,?,?)',(agent['id'],int(time.time()),through,pack(plan),thought,source,wall,cpu)).lastrowid
             message(c,agent['id'],plan['recipient'],'dialogue',plan['message'])
+            if economy.table_exists(c,'council_deliveries'):
+                delivered=unread if unread and context.get('dialogue_enabled') else unread+peers
+                c.executemany('INSERT OR IGNORE INTO council_deliveries VALUES(?,?,?)',[(agent['id'],r['id'],tid) for r in delivered])
             if plan['action']=='request_capability': message(c,agent['id'],'all','capability_request',pack(plan['parameters']))
         assignment=None
         if plan['action']=='create_project':
@@ -296,7 +337,7 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
             key=plan['parameters']['experiment_key']; row=c.execute("SELECT * FROM council_experiments WHERE key=? AND state='complete'",(key,)).fetchone()
             if not row or row['agent']==agent['id']: raise ValueError('Verify a completed experiment by a different generation')
             previous=json.loads(row['result']); original=previous.get('council_plan')
-            if not original or original['action'] not in ('directional','funding_tail','carry_screen'): raise ValueError('Only original measured research can be verified')
+            if not original or original['action'] not in ('directional','funding_tail','carry_screen','hedged_carry'): raise ValueError('Only original measured research can be verified')
             if digest([PROTOCOL,context.get('data_identity'),original['action'],original['parameters']])!=key: raise ValueError('Verification requires original data identity')
             original=validate_plan(original); evaluator=worker
             def verification(_):
@@ -316,23 +357,30 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
         if activity: activity('researching')
         if assignment:
             with c: c.execute("UPDATE council_assignments SET state='running',result=? WHERE id=?",(pack({'experiment':key}),assignment))
-        try: state,result=paid_task(economy_path,agent['id'],plan,lambda:worker(plan),task)
-        except Exception as exc:
-            with closing(economy.connect(economy_path,True)) as ec:
-                charged=ec.execute('SELECT state,report FROM economy_tasks WHERE id=?',(task,)).fetchone()
-            state='interrupted' if charged else 'rejected'; result={'error':str(exc),'prepaid':bool(charged)}
-        with c:
-            c.execute('UPDATE council_experiments SET state=?,result=? WHERE key=?',(state,pack(result),key))
-            if assignment:
-                c.execute('UPDATE council_assignments SET state=?,result=? WHERE id=?',(state,pack({'experiment':key,'result':result}),assignment))
-                requester=c.execute('SELECT requester FROM council_assignments WHERE id=?',(assignment,)).fetchone()[0]
-                message(c,agent['id'],requester,'assignment_result',f'Assignment #{assignment}: {state}; experiment {key}')
-                project=c.execute('SELECT project_id FROM council_assignments WHERE id=?',(assignment,)).fetchone()[0]
-                if project: c.execute('INSERT INTO council_project_updates(project,agent,created,body,evidence) VALUES(?,?,?,?,?)',(project,agent['id'],int(time.time()),f'Assignment #{assignment} {state}',key if state=='complete' else None))
-            summary=result.get('result',result); summary={k:v for k,v in summary.items() if k!='monthly'}
-            message(c,agent['id'],'all','measured_result',pack({'action':plan['action'],'state':state,'result':summary})[:12000])
-        return {'turn':tid,'agent':agent['id'],'paid':state!='rejected','state':state,'result':result}
+        if dispatch is not None:
+            dispatch(lambda:finish_experiment(path,economy_path,agent,plan,worker,task,key,tid,assignment,on_complete))
+            return {'turn':tid,'agent':agent['id'],'paid':True,'state':'queued','plan':plan}
+        return finish_experiment(path,economy_path,agent,plan,worker,task,key,tid,assignment,on_complete)
 
+def finish_experiment(path,economy_path,agent,plan,worker,task,key,tid,assignment,on_complete=None):
+    try: state,result=paid_task(economy_path,agent['id'],plan,lambda:worker(plan),task)
+    except Exception as exc:
+        with closing(economy.connect(economy_path,True)) as ec:
+            charged=ec.execute('SELECT state,report FROM economy_tasks WHERE id=?',(task,)).fetchone()
+        state='interrupted' if charged else 'rejected'; result={'error':str(exc),'prepaid':bool(charged)}
+    with closing(connect(path)) as c,c:
+        c.execute('UPDATE council_experiments SET state=?,result=? WHERE key=?',(state,pack(result),key))
+        if assignment:
+            c.execute('UPDATE council_assignments SET state=?,result=? WHERE id=?',(state,pack({'experiment':key,'result':result}),assignment))
+            requester=c.execute('SELECT requester FROM council_assignments WHERE id=?',(assignment,)).fetchone()[0]
+            message(c,agent['id'],requester,'assignment_result',f'Assignment #{assignment}: {state}; experiment {key}')
+            project=c.execute('SELECT project_id FROM council_assignments WHERE id=?',(assignment,)).fetchone()[0]
+            if project: c.execute('INSERT INTO council_project_updates(project,agent,created,body,evidence) VALUES(?,?,?,?,?)',(project,agent['id'],int(time.time()),f'Assignment #{assignment} {state}',key if state=='complete' else None))
+        summary=result.get('result',result); summary={k:v for k,v in summary.items() if k not in ('monthly','sources')}
+        message(c,agent['id'],'all','measured_result',pack({'action':plan['action'],'state':state,'result':summary})[:12000])
+    response={'turn':tid,'agent':agent['id'],'paid':state!='rejected','state':state,'result':result,'plan':plan}
+    if on_complete: on_complete(response)
+    return response
 
 def snapshot(path):
     with closing(connect(path)) as c:
@@ -412,15 +460,15 @@ def main():
 
 def _legacy_loop(x,context,worker,remaining,rounds):
     while x.listen or rounds<x.rounds:
-        rounds+=1
-        for a in economy.status(x.economy)['agents']:
-            if a['state']=='retired' or (x.agent!='all' and a['slot']!=x.agent): continue
-            if x.listen:
-                with closing(connect(x.db)) as c:
-                    if not inbox(c,a['id'])[2]: continue
-            try:
-                result=turn(x.db,x.economy,a,x.model,context,worker,remaining>0 and a['state']=='active'); remaining-=int(result.get('paid',False)); print(pack(result),flush=True)
-            except (ValueError,RuntimeError,OSError,KeyError,TypeError) as exc: print(pack({'agent':a['id'],'error':str(exc)}),flush=True)
-        if x.listen: time.sleep(x.pause)
+            rounds+=1
+            for a in economy.status(x.economy)['agents']:
+                if a['state']=='retired' or (x.agent!='all' and a['slot']!=x.agent): continue
+                if x.listen:
+                    with closing(connect(x.db)) as c:
+                        if not inbox(c,a['id'])[2]: continue
+                try:
+                    result=turn(x.db,x.economy,a,x.model,context,worker,remaining>0 and a['state']=='active'); remaining-=int(result.get('paid',False)); print(pack(result),flush=True)
+                except (ValueError,RuntimeError,OSError,KeyError,TypeError) as exc: print(pack({'agent':a['id'],'error':str(exc)}),flush=True)
+            if x.listen: time.sleep(x.pause)
 
 if __name__=='__main__': main()

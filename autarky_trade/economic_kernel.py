@@ -130,6 +130,9 @@ def upkeep(c,cfg,tick):
             if missed<cfg['grace_ticks']:
                 c.execute("UPDATE economy_agents SET state='conserving',missed=? WHERE id=?",(missed,ident))
                 continue
+            # A prepaid in-flight research task must settle before retirement.
+            if c.execute("SELECT 1 FROM economy_tasks WHERE agent=? AND state='running'",(ident,)).fetchone():
+                c.execute("UPDATE economy_agents SET state='conserving',missed=? WHERE id=?",(missed,ident)); continue
             # A production reservation must be flattened before funds can be returned.
             if production_locked(c,ident):
                 c.execute("UPDATE economy_agents SET state='liquidating',missed=? WHERE id=?",(missed,ident))
@@ -233,7 +236,7 @@ def run(path,tree_path,report,parts,cutoff,model='qwen3:4b',ticks=4,watts=None,p
     return {'protocol':PROTOCOL,'ticks':results,'economy':status(path)}
 
 
-def status(path):
+def status(path, include_locked=False):
     with closing(connect(path,True)) as c:
         c.execute('BEGIN')
         cfg=json.loads(c.execute('SELECT config FROM economy_config').fetchone()[0]); accounts={r[0]:r[1] for r in c.execute('SELECT * FROM economy_accounts')}
@@ -249,10 +252,13 @@ def status(path):
         agents=[dict(a,operating_cents=accounts[a['id']+':operating'],productive_cents=accounts[a['id']+':productive']) for a in c.execute('SELECT * FROM economy_agents ORDER BY slot,generation')]
         tasks=[dict(r,report=json.loads(r['report'])) for r in c.execute('SELECT * FROM economy_tasks ORDER BY tick DESC LIMIT 30')]
         tick=c.execute('SELECT coalesce(max(id),0) FROM economy_ticks').fetchone()[0]
-    return {'protocol':PROTOCOL,'mode':'SIMULATED ECONOMY','tick':tick,'config':cfg,'reserve_cents':accounts['reserve'],
+        locked=[dict(r) for r in c.execute("SELECT * FROM economy_production WHERE state='locked'")] if include_locked and table_exists(c,'economy_production') else []
+    result={'protocol':PROTOCOL,'mode':'SIMULATED ECONOMY','tick':tick,'config':cfg,'reserve_cents':accounts['reserve'],
             'spent_cents':accounts['spent'],'remaining_cents':cfg['initial_cents']+market_net-accounts['spent'],'paper_net_cents':market_net,
             'reconciled':True,'agents':agents,'recent_tasks':tasks,'real_revenue_usd':0,'self_sustaining':False,
             'note':'All capital, market settlements and charges are simulated. Runtime/energy estimates are not actual bills; real revenue remains zero.'}
+    if include_locked: result['locked_production']=locked
+    return result
 
 
 def actual_expenses(path):

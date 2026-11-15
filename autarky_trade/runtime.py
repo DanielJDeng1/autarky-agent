@@ -4,6 +4,7 @@ No live orders, private keys, or real-money claims. One foreground command, dura
 from __future__ import annotations
 import argparse
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
@@ -19,7 +20,7 @@ from urllib.parse import parse_qs
 from . import council, economic_kernel as economy, core
 from .coordinator import exclusive
 
-PROTOCOL='v0.27-runtime-1'
+PROTOCOL='v0.28-runtime-1'
 DAY=86400
 
 
@@ -31,6 +32,7 @@ def ensure(path):
         c.execute('CREATE TABLE IF NOT EXISTS runtime_state(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS runtime_candidates(key TEXT PRIMARY KEY,agent TEXT NOT NULL,plan TEXT NOT NULL,report TEXT NOT NULL,created INTEGER NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS runtime_events(id INTEGER PRIMARY KEY,created INTEGER NOT NULL,kind TEXT NOT NULL,agent TEXT,body TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS runtime_equity_history(observed INTEGER PRIMARY KEY,settled INTEGER NOT NULL,marked INTEGER NOT NULL,reserve INTEGER NOT NULL,paper_net INTEGER NOT NULL)')
 
 
 def set_state(path,key,value):
@@ -93,10 +95,11 @@ def reconcile_production(c,trials):
     return changes
 
 
-def advance_economy(path,trials,now=None):
+def advance_economy(path,trials,now=None,recover_interrupted=True):
     now=int(time.time()) if now is None else now
     with exclusive(str(Path(path).resolve())+'.lock'),closing(economy.connect(path)) as c,c:
-        clock_setup(c,now); cfg=json.loads(c.execute('SELECT config FROM economy_config').fetchone()[0]); economy.recover(c)
+        clock_setup(c,now); cfg=json.loads(c.execute('SELECT config FROM economy_config').fetchone()[0])
+        if recover_interrupted: economy.recover(c)
         changes=reconcile_production(c,trials)
         last=c.execute('SELECT last_day FROM economy_clock').fetchone()[0]
         # UTC day boundaries; catch up at most 30 per pass, never charge twice.
@@ -126,6 +129,38 @@ def capital_history(path):
             else: history.append(point)
         if len(history)>800: history=[history[i] for i in range(0,len(history),math.ceil(len(history)/799))]+[history[-1]]
         return history
+
+
+def equity_point(paths,now=None):
+    now=int(time.time()) if now is None else now
+    ep,pp,cp=paths['economy'],paths['production'],paths['council']
+    e=economy.status(ep,include_locked=True); trials=production_status(pp)['trials']; marked=e['remaining_cents']
+    for l in e['locked_production']:
+        t=next((x for x in trials if x['id']==l['trial']),None)
+        if not t: raise ValueError('Reserved trial missing from production history')
+        marked+=round(t['accounts']['candidate_normal']['equity']*100)-l['settled_cents']
+    with closing(council.connect(cp)) as c,c:
+        # One observation per UTC minute; no synthetic interpolation or backfilled marks.
+        c.execute('INSERT OR REPLACE INTO runtime_equity_history VALUES(?,?,?,?,?)',(now//60*60,e['remaining_cents'],marked,e['reserve_cents'],e.get('paper_net_cents',0)))
+
+
+def equity_history(path,limit=1000):
+    with closing(council.connect(path)) as c:
+        return [dict(r) for r in reversed(c.execute('SELECT * FROM runtime_equity_history ORDER BY observed DESC LIMIT ?',(limit,)).fetchall())]
+
+
+def operator_queue(path,agents):
+    """Delivery receipt: a valid talk addressed to operator advances the new runtime cursor.
+    Older turns may have consumed messages without responding; label as processed, not answered.
+    """
+    with closing(council.connect(path)) as c:
+        output=[]
+        for a in agents:
+            if a['state']=='retired': continue
+            n=c.execute('SELECT coalesce(max(inbox_through),0) FROM council_turns WHERE agent=?',(a['id'],)).fetchone()[0]
+            rows=council.unread_messages(c,a['id'],'operator',100000)
+            output.append({'agent':a['id'],'pending':len(rows),'oldest':rows[0]['created'] if rows else None,'messages':rows[:5],'processed_through':n})
+        return output
 
 
 def migrate_production(path):
@@ -186,6 +221,7 @@ def deployment_action(paths,agent,plan,parts,cutoff,data_identity):
     artifact=production.freeze_artifact(review,parts,cutoff,1,p['pair'],p['horizon'],ident,a['productive_cents'],start,start+90*DAY,now)
     artifact.update(source_node=None,source_experiment=key,source='council_v27')
     if artifact['thresholds']['candidate'] is None: raise ValueError('Frozen calibration abstains; no qualifying deployment')
+    if get_state(cp).get('research_paused') or get_state(cp).get('autonomy_paused'): raise ValueError('Deployment paused by operator')
     trial=production.create(pp,artifact,ep); migrate_production(pp)
     advance_economy(ep,production_status(pp)['trials'])
     return {'action':'deploy_paper','trial':trial,'experiment_key':key,'thresholds':artifact['thresholds'],'start':start,'paper_only':True}
@@ -201,10 +237,10 @@ def trade_events(path):
     if not Path(path).is_file(): return []
     with closing(sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True)) as c:
         c.row_factory=sqlite3.Row; rows=[]
-        for r in c.execute("SELECT e.id,e.observed,e.report,t.agent FROM production_events e JOIN production_trials t ON t.id=e.trial WHERE json_array_length(json_extract(e.report,'$.fills'))>0 OR json_extract(e.report,'$.decision') IS NOT NULL OR json_array_length(json_extract(e.report,'$.missed'))>0 ORDER BY e.id DESC LIMIT 200"):
-            d=json.loads(r['report'])
+        for r in c.execute("SELECT e.id,e.observed,e.report,t.agent,t.plan FROM production_events e JOIN production_trials t ON t.id=e.trial WHERE json_array_length(json_extract(e.report,'$.fills'))>0 OR json_extract(e.report,'$.decision') IS NOT NULL OR json_array_length(json_extract(e.report,'$.missed'))>0 ORDER BY e.id DESC LIMIT 200"):
+            d=json.loads(r['report']); plan=json.loads(r['plan'])
             for f in d.get('fills',[]):
-                rows.append({'id':r['id'],'time':r['observed'],'agent':r['agent'],'account':f['account'],'side':f['side'],'reason':f['reason'],'bid':d.get('bid'),'ask':d.get('ask'),'cash_after':f['after']['cash'],'units_after':f['after']['units']})
+                rows.append({'id':r['id'],'time':r['observed'],'agent':r['agent'],'account':f['account'],'side':f['side'],'reason':f['reason'],'bid':d.get('bid'),'ask':d.get('ask'),'cash_after':f['after']['cash'],'units_after':f['after']['units'],'pair':plan.get('pair'),'quantity':abs(f['after']['units']-f['before']['units']),'fee_usd':f['after']['fees']-f['before']['fees']})
             if d.get('decision') or d.get('missed'):
                 rows.append({'id':r['id'],'time':r['observed'],'agent':r['agent'],'decision':d.get('decision'),'missed':d.get('missed',[])})
             if len(rows)>=100: break
@@ -230,10 +266,7 @@ def peer_profiles(snapshot,agents,economy_path=None):
 
 
 def pending_peer(path,agent):
-    with closing(council.connect(path)) as c:
-        through=c.execute('SELECT coalesce(max(inbox_through),0) FROM council_turns WHERE agent=?',(agent['id'],)).fetchone()[0]
-        direct=c.execute("SELECT 1 FROM council_messages WHERE id>? AND sender NOT IN ('operator','system',?) AND recipient IN (?,?) LIMIT 1",(through,agent['id'],agent['slot'],agent['id'])).fetchone()
-        return bool(direct)
+    with closing(council.connect(path)) as c: return bool(council.unread_messages(c,agent['id'],'peer',1))
 
 
 def pending_operator(path,agent):
@@ -281,10 +314,20 @@ def market_quote(pair):
     return bid,ask
 
 
+def secondary_quote(pair):
+    from urllib.request import Request,urlopen
+    symbol={'XBTUSD':'BTC-USD','ETHUSD':'ETH-USD'}[pair]
+    req=Request('https://api.exchange.coinbase.com/products/'+symbol+'/ticker',headers={'User-Agent':'Autarky/0.28'})
+    with urlopen(req,timeout=5) as response: raw=json.load(response)
+    bid,ask=float(raw['bid']),float(raw['ask'])
+    if not math.isfinite(ask) or not 0<bid<=ask: raise ValueError('Invalid Coinbase quote')
+    return {'bid':bid,'ask':ask,'observed':int(time.time())}
+
+
 def market_loop(paths,stop,poll):
     """Independent public market worker; a slow LLM cannot block price monitoring."""
     from . import production
-    cp,pp=paths['council'],paths['production']; bars={}; last_hour=None; predictions=get_state(cp).get('market',{}).get('predictions',{}); forecasts=get_state(cp).get('market',{}).get('forecasts',{})
+    cp,pp=paths['council'],paths['production']; bars={}; last_hour=None; last_sample=0; last_secondary=0; secondary={}; spreads=[]; predictions=get_state(cp).get('market',{}).get('predictions',{}); forecasts=get_state(cp).get('market',{}).get('forecasts',{})
     while not stop.is_set():
         try:
             now=int(time.time()); hour=now//3600*3600; trials=production_status(pp)['trials']; quotes={}; errors={}
@@ -322,7 +365,18 @@ def market_loop(paths,stop,poll):
                                 if result.get('decision'): predictions[t['agent']]=result['decision']
                                 if result.get('fills') or result.get('decision') or result.get('missed'): event(cp,'production',result,t['agent'])
                 except Exception as exc: errors[pair]=str(exc)
-            set_state(cp,'market',{'observed':int(time.time()),'quotes':quotes,'errors':errors,'predictions':predictions,'forecasts':forecasts,'source':'Kraken public spot','paper_only':True})
+            # Secondary venue is informational only; fetch after primary execution checks.
+            if now-last_secondary>=60:
+                last_secondary=now; secondary={}
+                for pair in production.PAIRS:
+                    try: secondary[pair]=secondary_quote(pair)
+                    except Exception as exc: errors['coinbase:'+pair]=str(exc)
+                from .mechanisms import spread_screen
+                spreads=spread_screen(quotes,secondary,int(time.time()))
+            set_state(cp,'market',{'secondary_quotes':secondary,'spread_screens':spreads,'observed':int(time.time()),'quotes':quotes,'errors':errors,'predictions':predictions,'forecasts':forecasts,'source':'Kraken public spot','paper_only':True})
+            if int(time.time())-last_sample>=60:
+                try: equity_point(paths); last_sample=int(time.time())
+                except (OSError,ValueError,sqlite3.Error) as exc: errors['equity']=str(exc)
             if errors: event(cp,'market_warning',errors)
         except Exception as exc: event(cp,'market_error',{'error':str(exc)})
         stop.wait(poll)
@@ -341,21 +395,18 @@ def evidence_context(files):
 
 
 def api_snapshot(paths):
-    cp=paths['council']; d=council.snapshot(cp); e=economy.status(paths['economy']); s=get_state(cp)
+    cp=paths['council']; d=council.snapshot(cp); e=economy.status(paths['economy'],include_locked=True); s=get_state(cp)
     try: p=production_status(paths['production']); trades=trade_events(paths['production'])
     except (OSError,ValueError,sqlite3.Error) as exc: p={'trials':[],'error':str(exc)}; trades=[]
     with closing(council.connect(cp)) as c:
         events=[dict(r,body=json.loads(r['body'])) for r in c.execute('SELECT * FROM runtime_events ORDER BY id DESC LIMIT 100')]
-    marked=e['remaining_cents']; locked=[]
-    with closing(economy.connect(paths['economy'],True)) as ec:
-        if economy.table_exists(ec,'economy_production'):
-            locked=[dict(r) for r in ec.execute("SELECT * FROM economy_production WHERE state='locked'")]
+    marked=e['remaining_cents']; locked=e.pop('locked_production')
     for l in locked:
         trial=next((t for t in p['trials'] if t['id']==l['trial']),None)
         if trial: marked+=round(trial['accounts']['candidate_normal']['equity']*100)-l['settled_cents']
     expenses=paths.get('resources')
     actual=economy.actual_expenses(expenses) if expenses and Path(expenses).is_file() else {'recorded':False,'actual_expenses_usd':None}
-    return dict(d,marked_pool_cents=marked,locked_production=locked,actual_expenses=actual,candidates=candidate_list(cp),protocol=PROTOCOL,economy=e,production=p,trade_events=trades,capital_history=capital_history(paths['economy']),peer_profiles=peer_profiles(d,e['agents'],paths['economy']),runtime=s,events=events,server_time=int(time.time()))
+    return dict(d,marked_pool_cents=marked,locked_production=locked,actual_expenses=actual,candidates=candidate_list(cp),protocol=PROTOCOL,economy=e,production=p,trade_events=trades,capital_history=capital_history(paths['economy']),peer_profiles=peer_profiles(d,e['agents'],paths['economy']),equity_history=equity_history(cp),operator_queue=operator_queue(cp,e['agents']),runtime=s,events=events,server_time=int(time.time()))
 
 
 def serve(paths,port,stop):
@@ -387,8 +438,16 @@ def serve(paths,port,stop):
                     if len(matches)!=1: raise ValueError('No active matching paper trial')
                     production.stop(paths['production'],matches[0]['id']); event(paths['council'],'operator_stop_trial',{'trial':matches[0]['id']},matches[0]['agent']); return self.reply(pack({'ok':True}))
                 if self.path=='/api/control':
-                    if d.get('action') not in ('pause_research','resume_research'): raise ValueError('Invalid control')
-                    set_state(paths['council'],'research_paused',d['action']=='pause_research'); event(paths['council'],'operator_control',{'action':d['action']}); return self.reply(pack({'ok':True}))
+                    if d.get('action') not in ('pause_research','resume_research','pause_autonomy','resume_autonomy','flatten_all'): raise ValueError('Invalid control')
+                    action=d['action']
+                    if action=='flatten_all':
+                        from . import production
+                        set_state(paths['council'],'research_paused',True)
+                        for t in production_status(paths['production'])['trials']:
+                            if t['state'] not in ('complete','stopped'): production.stop(paths['production'],t['id'])
+                    elif action.endswith('autonomy'): set_state(paths['council'],'autonomy_paused',action=='pause_autonomy')
+                    else: set_state(paths['council'],'research_paused',action=='pause_research')
+                    event(paths['council'],'operator_control',{'action':action}); return self.reply(pack({'ok':True}))
                 return self.send_error(404)
             except (ValueError,KeyError,TypeError,sqlite3.Error) as exc: return self.reply(pack({'error':str(exc)}),code=400)
         def log_message(self,*args): pass
@@ -400,16 +459,19 @@ def serve(paths,port,stop):
 
 def run(paths,model,cutoff,evidence,research_interval=300,poll=30,daily_budget=3,port=8768):
     from . import multiyear, autonomous_research as old, production
-    cp,ep,pp=paths['council'],paths['economy'],paths['production']; ensure(cp)
+    cp,ep,pp=paths['council'],paths['economy'],paths['production']; economy.status(ep)
     if not 30<=research_interval or not 15<=poll or not 0<=daily_budget<=20: raise ValueError('Research interval >=30, poll >=15, daily budget 0..20')
     parts={p:multiyear.segments(paths[k],cutoff) for p,k in zip(production.PAIRS,('btc','eth'))}; funding=json.loads(Path(paths['funding']).read_text(encoding='utf-8-sig'))
     base={'data_identity':council.digest([cutoff,{p:old.fingerprint(parts[p],p) for p in production.PAIRS},funding.get('events_sha256')]),'cutoff':cutoff,'historical_evidence':evidence_context(evidence)}
-    stop=threading.Event(); last={}; last_peer={}; last_econ=0; cursor=0
+    stop=threading.Event(); last={}; last_peer={}; last_econ=0; cursor=0; job=None; executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='autarky-research')
     with exclusive(str(Path(cp).resolve())+'.runtime.lock'):
+        ensure(cp)
         # Fail fast if the old production monitor still holds its lock.
         if Path(pp).is_file():
             with exclusive(str(Path(pp).resolve())+'.lock'): pass
         migrate_production(pp)
+        with closing(council.connect(cp)) as c,c: council.recover_experiments(c,ep)
+        set_state(cp,'research_job',None)
         for change in advance_economy(ep,production_status(pp)['trials']): event(cp,'paper_settlement',change,change['agent'])
         set_state(cp,'run',{'state':'running','started':int(time.time()),'heartbeat':int(time.time()),'daily_budget':daily_budget,'research_interval':research_interval,'poll':poll,'model':model})
         event(cp,'runtime_start',{'protocol':PROTOCOL,'paper_only':True})
@@ -426,13 +488,19 @@ def run(paths,model,cutoff,evidence,research_interval=300,poll=30,daily_budget=3
         try:
             while not stop.is_set():
                 now=int(time.time()); state=get_state(cp)
+                if job is not None and job.done():
+                    try: job.result()
+                    except Exception as exc: event(cp,'research_worker_error',{'error':str(exc)})
+                    job=None; set_state(cp,'research_job',None)
+                if not threads[0].is_alive():
+                    event(cp,'worker_restart',{'worker':'market'}); threads[0]=threading.Thread(target=market_loop,args=(paths,stop,poll),daemon=True); threads[0].start()
                 try: trials=production_status(pp)['trials']; eco=economy.status(ep)
                 except (OSError,ValueError,sqlite3.Error) as exc:
                     event(cp,'runtime_warning',{'error':str(exc)}); stop.wait(10); continue
                 agents=[a for a in eco['agents'] if a['state']!='retired']
                 if now-last_econ>=15:
                     try:
-                        for change in advance_economy(ep,trials,now): event(cp,'paper_settlement',change,change['agent'])
+                        for change in advance_economy(ep,trials,now,recover_interrupted=job is None): event(cp,'paper_settlement',change,change['agent'])
                         for a in economy.status(ep)['agents']:
                             if a['state']=='liquidating':
                                 for t in trials:
@@ -440,30 +508,40 @@ def run(paths,model,cutoff,evidence,research_interval=300,poll=30,daily_budget=3
                         last_econ=now
                     except (ValueError,RuntimeError,sqlite3.Error) as exc: event(cp,'economy_warning',{'error':str(exc)}); last_econ=now
                     eco=economy.status(ep); agents=[a for a in eco['agents'] if a['state']!='retired']
-                with closing(council.connect(cp)) as c,c: council.recover_experiments(c,ep)
-                recover_assignments(cp,agents)
+                if job is None:
+                    with closing(council.connect(cp)) as c,c: council.recover_experiments(c,ep)
+                    recover_assignments(cp,agents)
                 chosen=choose_agent(cp,agents,cursor,now,last,last_peer,research_interval)
+                if chosen and state.get('autonomy_paused',False) and not pending_operator(cp,chosen) and not pending_peer(cp,chosen): chosen=None
                 if not chosen: stop.wait(2); continue
                 a=chosen; ident=a['id']; cursor=agents.index(a)+1; last[ident]=now; last_peer[ident]=now
                 snap=council.snapshot(cp); profiles=peer_profiles(snap,eco['agents'],ep); assignments=[r for r in snap['assignments'] if r['assignee']==ident and r['state']=='pending']
                 # Count durable daily paid tasks from council experiment registrations using turn timestamps.
                 with closing(council.connect(cp)) as c:
                     used=c.execute("SELECT count(*) FROM council_experiments e JOIN council_turns t ON t.id=e.turn WHERE t.created>=? AND e.state NOT IN ('rejected','duplicate')",(now//DAY*DAY,)).fetchone()[0]
-                allowed=not state.get('research_paused',False) and used<daily_budget and a['state']=='active'
-                market=state.get('market',{}); context={**base,'market':market,'production_trials':[t for t in trials if t['state'] not in ('complete','stopped') or t['agent']==ident][-8:],'peer_profiles':profiles,'pending_assignments':assignments,'open_projects':[{'id':p['id'],'owner':p['owner'],'title':p['title'],'hypothesis':p['hypothesis'],'updates':p['updates'][:2]} for p in snap['projects'] if p['state']=='open'][:8],'qualified_candidates':[r for r in candidate_list(cp) if r['agent']==ident][:8], 'dialogue_enabled':True,'research_budget_today':max(0,daily_budget-used),'market_note':'Current observations are timestamped; stale/missing data is not a live quote. Frozen paper trades execute independently. Do not claim a trade you did not execute.'}
+                set_state(cp,'daily_research',{'day':now//DAY,'used':used,'limit':daily_budget})
+                allowed=job is None and not state.get('research_paused',False) and not state.get('autonomy_paused',False) and used<daily_budget and a['state']=='active'
+                market=state.get('market',{}); context={**base,'market':market,'production_trials':[t for t in trials if t['state'] not in ('complete','stopped') or t['agent']==ident][-8:],'peer_profiles':profiles,'pending_assignments':assignments,'open_projects':[{'id':p['id'],'owner':p['owner'],'title':p['title'],'hypothesis':p['hypothesis'],'updates':p['updates'][:2]} for p in snap['projects'] if p['state']=='open'][:8],'qualified_candidates':[r for r in candidate_list(cp) if r['agent']==ident][:8], 'dialogue_enabled':True,'research_budget_today':max(0,daily_budget-used),'research_worker_busy':job is not None,'market_note':'Current observations are timestamped; stale/missing data is not a live quote. Frozen paper trades execute independently. Do not claim a trade you did not execute.'}
                 def activity(label): set_state(cp,'agent:'+ident,{'state':label,'since':int(time.time())})
                 try:
                     captured={}
-                    def worker(plan):
+                    def worker(plan,captured=captured):
                         captured['plan']=plan
-                        return council.research(plan,parts,funding,cutoff,lambda r:captured.update(report=r))
-                    result=council.turn(cp,ep,a,model,context,worker,allowed,activity=activity,paid_gate=lambda:not get_state(cp).get('research_paused',False))
-                    candidate=remember_candidate(cp,ident,captured.get('plan'),result,captured.get('report'))
-                    if candidate: event(cp,'qualified_candidate',candidate,ident)
+                        return council.research(plan,parts,funding,cutoff,lambda r:captured.update(report=r),cache=Path(paths['funding']).parent/'carry-archives')
+                    def complete(result,ident=ident,captured=captured):
+                        candidate=remember_candidate(cp,ident,captured.get('plan'),result,captured.get('report'))
+                        if candidate: event(cp,'qualified_candidate',candidate,ident)
+                        event(cp,'research_finished',{'turn':result.get('turn'),'state':result.get('state'),'paid':result.get('paid')},ident)
+                    def dispatch(fn):
+                        nonlocal job
+                        if job is not None: raise RuntimeError('Research worker already occupied')
+                        set_state(cp,'research_job',{'agent':ident,'started':int(time.time()),'state':'researching'})
+                        job=executor.submit(fn)
+                    result=council.turn(cp,ep,a,model,context,worker,allowed,activity=activity,paid_gate=lambda:job is None and not get_state(cp).get('research_paused',False),dispatch=dispatch,on_complete=complete)
                     plan=result.get('plan',{})
                     if plan.get('action') in ('deploy_paper','stop_paper'):
                         try:
-                            if plan['action']=='deploy_paper' and get_state(cp).get('research_paused',False): raise ValueError('Deployment paused by operator')
+                            if plan['action']=='deploy_paper' and (job is not None or get_state(cp).get('research_paused',False) or get_state(cp).get('autonomy_paused',False)): raise ValueError('Deployment paused by operator')
                             decision=deployment_action(paths,a,plan,parts,cutoff,base['data_identity']); event(cp,'paper_decision',decision,ident)
                             with closing(council.connect(cp)) as c,c: council.message(c,'system',ident,'paper_decision',pack(decision))
                         except (ValueError,RuntimeError,sqlite3.Error) as exc:
@@ -476,13 +554,26 @@ def run(paths,model,cutoff,evidence,research_interval=300,poll=30,daily_budget=3
         except KeyboardInterrupt: pass
         finally:
             stop.set()
+            # A committed research task is allowed to finish; no new task starts during shutdown.
+            executor.shutdown(wait=True,cancel_futures=False)
+            set_state(cp,'research_job',None)
             for t in threads: t.join(timeout=2)
             s=get_state(cp).get('run',{}); s.update(state='stopped',heartbeat=int(time.time())); set_state(cp,'run',s); event(cp,'runtime_stop',{})
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--home',required=True); p.add_argument('--model',default='qwen3:4b'); p.add_argument('--cutoff',type=int,required=True); p.add_argument('--research-interval',type=int,default=300); p.add_argument('--poll',type=int,default=30); p.add_argument('--daily-budget',type=int,default=3); p.add_argument('--port',type=int,default=8768)
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--home',required=True); p.add_argument('--model',default='qwen3:4b'); p.add_argument('--cutoff',type=int,required=True); p.add_argument('--research-interval',type=int,default=300); p.add_argument('--poll',type=int,default=30); p.add_argument('--daily-budget',type=int,default=3); p.add_argument('--port',type=int,default=8768); p.add_argument('--check',action='store_true',help='Read-only installation and frozen model checks')
     x=p.parse_args(); h=Path(x.home).resolve(); paths={k:h/(k+'.sqlite') for k in ('council','economy','production')}; paths.update(resources=h/'btc-v2.sqlite',btc=h/'history/btc-hourly-full.csv',eth=h/'history/eth-hourly-full.csv',funding=h/'history/funding-btc-eth-v22.json'); evidence=[f for f in (h/'history/funding-state-v23.json',h/'history/horizon-review-v20.json') if f.exists()]
+    if x.check:
+        from . import production, multiyear
+        checks={'paths':{k:{'path':str(v),'exists':Path(v).is_file()} for k,v in paths.items()},'paper_only':True}
+        checks['economy']=economy.status(paths['economy'])['reconciled']
+        checks['production_trials']=len(production_status(paths['production'])['trials'])
+        checks['history_bars']={k:sum(map(len,multiyear.segments(paths[k],x.cutoff))) for k in ('btc','eth')}
+        if Path(paths['production']).is_file():
+            with closing(sqlite3.connect(Path(paths['production']).resolve().as_uri()+'?mode=ro',uri=True)) as c:
+                checks['frozen_identity_ok']=all(production.digest(json.loads(p))==i and json.loads(p)['code_identity']==production.code_identity() for i,p in c.execute('SELECT id,plan FROM production_trials'))
+        print(json.dumps(checks,indent=2)); return
     run(paths,x.model,x.cutoff,evidence,x.research_interval,x.poll,x.daily_budget,x.port)
 
 if __name__=='__main__': main()
