@@ -109,6 +109,14 @@ def recover(c):
     c.execute("UPDATE economy_ticks SET status='interrupted' WHERE status='running'")
 
 
+def table_exists(c,name):
+    return c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(name,)).fetchone() is not None
+
+
+def production_locked(c,ident):
+    return table_exists(c,'economy_production') and c.execute("SELECT 1 FROM economy_production WHERE agent=? AND state='locked'",(ident,)).fetchone() is not None
+
+
 def upkeep(c,cfg,tick):
     for a in c.execute("SELECT * FROM economy_agents WHERE state!='retired' ORDER BY slot").fetchall():
         ident=a['id']; op=ident+':operating'
@@ -122,7 +130,10 @@ def upkeep(c,cfg,tick):
             if missed<cfg['grace_ticks']:
                 c.execute("UPDATE economy_agents SET state='conserving',missed=? WHERE id=?",(missed,ident))
                 continue
-            # Productive funds are idle in this version, never an open position.
+            # A production reservation must be flattened before funds can be returned.
+            if production_locked(c,ident):
+                c.execute("UPDATE economy_agents SET state='liquidating',missed=? WHERE id=?",(missed,ident))
+                continue
             for bucket in ('productive','operating'):
                 name=ident+':'+bucket; amount=balance(c,name)
                 if amount: transfer(c,tick,name,'reserve',amount,'retirement',ident+':retire:'+bucket)
@@ -210,6 +221,7 @@ def run(path,tree_path,report,parts,cutoff,model='qwen3:4b',ticks=4,watts=None,p
     allocator.validate(report,tree_path,parts,cutoff)
     with exclusive(str(Path(path).resolve())+'.lock'),exclusive(str(Path(tree_path).resolve())+'.allocator.lock'),closing(connect(path)) as c:
         cfg=json.loads(c.execute('SELECT config FROM economy_config').fetchone()[0])
+        if table_exists(c,'economy_clock'): raise ValueError('Use the continuous runtime for this elapsed-time economy')
         with c: recover(c)
         def worker(meta,chosen_model):
             return tree.run(tree_path,parts,cutoff,model=chosen_model,rounds=1,budget=1,emit=emit,cross_asset=True,
@@ -227,17 +239,20 @@ def status(path):
         cfg=json.loads(c.execute('SELECT config FROM economy_config').fetchone()[0]); accounts={r[0]:r[1] for r in c.execute('SELECT * FROM economy_accounts')}
         # Reconstruct every balance from the append-only transfer journal.
         rebuilt={k:0 for k in accounts}
-        for r in c.execute('SELECT source,destination,cents FROM economy_entries ORDER BY id'):
-            if r[0]!='external_simulated_seed': rebuilt[r[0]]-=r[2]
-            rebuilt[r[1]]+=r[2]
-        if rebuilt!=accounts or sum(accounts.values())!=cfg['initial_cents']: raise ValueError('Economic ledger does not reconcile')
+        market_net=0
+        for r in c.execute('SELECT source,destination,cents,kind FROM economy_entries ORDER BY id'):
+            if r[0]=='external_simulated_market' and r[3]=='paper_gain': market_net+=r[2]
+            elif r[0]!='external_simulated_seed': rebuilt[r[0]]-=r[2]
+            if r[1]=='external_simulated_market' and r[3]=='paper_loss': market_net-=r[2]
+            else: rebuilt[r[1]]+=r[2]
+        if rebuilt!=accounts or sum(accounts.values())!=cfg['initial_cents']+market_net: raise ValueError('Economic ledger does not reconcile')
         agents=[dict(a,operating_cents=accounts[a['id']+':operating'],productive_cents=accounts[a['id']+':productive']) for a in c.execute('SELECT * FROM economy_agents ORDER BY slot,generation')]
         tasks=[dict(r,report=json.loads(r['report'])) for r in c.execute('SELECT * FROM economy_tasks ORDER BY tick DESC LIMIT 30')]
         tick=c.execute('SELECT coalesce(max(id),0) FROM economy_ticks').fetchone()[0]
     return {'protocol':PROTOCOL,'mode':'SIMULATED ECONOMY','tick':tick,'config':cfg,'reserve_cents':accounts['reserve'],
-            'spent_cents':accounts['spent'],'remaining_cents':cfg['initial_cents']-accounts['spent'],
+            'spent_cents':accounts['spent'],'remaining_cents':cfg['initial_cents']+market_net-accounts['spent'],'paper_net_cents':market_net,
             'reconciled':True,'agents':agents,'recent_tasks':tasks,'real_revenue_usd':0,'self_sustaining':False,
-            'note':'No production receipts yet; all capital and charges are simulated. Runtime/energy estimates are not actual bills. Existing paper accounts are independent.'}
+            'note':'All capital, market settlements and charges are simulated. Runtime/energy estimates are not actual bills; real revenue remains zero.'}
 
 
 def actual_expenses(path):

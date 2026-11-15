@@ -21,8 +21,8 @@ from . import economic_kernel as economy
 PROTOCOL='v0.26-council-1'
 SLOTS=economy.SLOTS
 PAIRS=('XBTUSD','ETHUSD')
-ACTIONS=('talk','conserve','directional','funding_tail','carry_screen','request_capability')
-PAID=('directional','funding_tail','carry_screen')
+ACTIONS=('talk','conserve','directional','funding_tail','carry_screen','request_capability','delegate','accept_task','decline_task','review','deploy_paper','stop_paper','create_project','project_update','verify')
+PAID=('directional','funding_tail','carry_screen','verify')
 
 
 def pack(x): return json.dumps(x,sort_keys=True,separators=(',',':'),allow_nan=False)
@@ -37,13 +37,17 @@ def connect(path, create=False):
     try:
         with c:
             tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-            if tables-{'council_config','council_messages','council_turns','council_experiments'}: raise ValueError('Use a separate council database')
+            if tables-{'council_config','council_messages','council_turns','council_experiments','council_assignments','runtime_state','runtime_events','runtime_candidates','council_projects','council_project_updates'}: raise ValueError('Use a separate council database')
             if create:
                 c.executescript('''CREATE TABLE IF NOT EXISTS council_config(protocol TEXT NOT NULL, economy_path TEXT);
                 CREATE TABLE IF NOT EXISTS council_messages(id INTEGER PRIMARY KEY, created INTEGER NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS council_turns(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, created INTEGER NOT NULL, inbox_through INTEGER NOT NULL, plan TEXT NOT NULL, reasoning TEXT, source TEXT NOT NULL, wall_seconds REAL NOT NULL, python_cpu_seconds REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS council_assignments(id INTEGER PRIMARY KEY, requester TEXT NOT NULL, assignee TEXT NOT NULL, state TEXT NOT NULL, plan TEXT NOT NULL, created INTEGER NOT NULL, result TEXT);
+                CREATE TABLE IF NOT EXISTS council_projects(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, hypothesis TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS council_project_updates(id INTEGER PRIMARY KEY, project INTEGER NOT NULL, agent TEXT NOT NULL, created INTEGER NOT NULL, body TEXT NOT NULL, evidence TEXT);
                 CREATE TABLE IF NOT EXISTS council_experiments(key TEXT PRIMARY KEY, agent TEXT NOT NULL, turn INTEGER NOT NULL, task TEXT NOT NULL UNIQUE, state TEXT NOT NULL, result TEXT NOT NULL);''')
                 if not c.execute('SELECT 1 FROM council_config').fetchone(): c.execute('INSERT INTO council_config(protocol) VALUES(?)',(PROTOCOL,))
+            if create and 'project_id' not in {r[1] for r in c.execute('PRAGMA table_info(council_assignments)')}: c.execute('ALTER TABLE council_assignments ADD COLUMN project_id INTEGER')
             if c.execute('SELECT protocol FROM council_config').fetchone()[0]!=PROTOCOL: raise ValueError('Wrong council protocol')
     except BaseException: c.close(); raise
     return c
@@ -71,9 +75,13 @@ def inbox(c,agent):
     unread=[dict(r) for r in c.execute("SELECT * FROM council_messages WHERE id>? AND id<=? AND sender='operator' AND kind='operator' AND recipient IN ('all',?,?) ORDER BY id LIMIT 4",(through,high,slot,agent))]
     recent=[dict(r) for r in c.execute("SELECT * FROM council_messages WHERE recipient IN ('all',?,?) OR sender=? ORDER BY id DESC LIMIT 30",(slot,agent,agent))]
     cap=unread[-1]['id'] if len(unread)==4 else high
+    peers=[dict(r) for r in c.execute("SELECT * FROM council_messages WHERE id>? AND id<=? AND sender NOT IN ('operator','system',?) AND recipient IN (?,?) ORDER BY id LIMIT 4",(through,cap,agent,slot,agent))]
+    if len(peers)==4: cap=min(cap,peers[-1]['id'])
+    unread=[r for r in unread if r['id']<=cap]
+    peers=[r for r in peers if r['id']<=cap]
     # Recent context must not disclose future operator instructions beyond the acknowledged batch.
     recent=[r for r in recent if r['id']<=cap]
-    return sorted({r['id']:r for r in recent+unread}.values(),key=lambda r:r['id']),cap,unread
+    return sorted({r['id']:r for r in recent+unread+peers}.values(),key=lambda r:r['id']),cap,unread
 
 
 def validate_plan(raw):
@@ -93,6 +101,21 @@ def validate_plan(raw):
         if set(p)!= {'pair'} or p['pair'] not in PAIRS: raise ValueError('Invalid carry screen pair')
     elif a=='request_capability':
         if set(p)!= {'capability','evidence_needed'} or any(not isinstance(v,str) or not v.strip() or len(v)>1000 for v in p.values()): raise ValueError('Describe capability and evidence needed')
+    elif a=='delegate':
+        if set(p)-{'action','parameters','question','project_id'} or not {'action','parameters','question'}<=set(p) or p['action'] not in (*PAID,'review') or not isinstance(p['question'],str) or not 1<=len(p['question'])<=1000 or raw['recipient'] in ('all','operator'): raise ValueError('Delegate a concrete experiment/review to one peer')
+        if 'project_id' in p and (type(p['project_id']) is not int or p['project_id']<=0): raise ValueError('Invalid project id')
+        nested=validate_plan(dict(action=p['action'],recipient='all',message=p['question'],rationale=p['question'],parameters=p['parameters']))
+        p=dict(p,parameters=nested['parameters'])
+    elif a in ('accept_task','decline_task'):
+        if set(p)!= {'task_id'} or type(p['task_id']) is not int or p['task_id']<=0: raise ValueError('Require a positive assignment id')
+    elif a in ('review','deploy_paper','verify'):
+        if set(p)!= {'experiment_key'} or not isinstance(p['experiment_key'],str) or len(p['experiment_key'])!=64: raise ValueError('Require an experiment key')
+    elif a=='create_project':
+        if set(p)!= {'title','hypothesis'} or any(not isinstance(v,str) or not 1<=len(v)<=1000 for v in p.values()): raise ValueError('Project title and economic hypothesis required')
+    elif a=='project_update':
+        if set(p)!= {'project_id','update','state','experiment_key'} or type(p['project_id']) is not int or p['project_id']<=0 or not isinstance(p['update'],str) or not 1<=len(p['update'])<=2000 or p['state'] not in ('open','complete','abandoned') or (p['experiment_key'] is not None and (not isinstance(p['experiment_key'],str) or len(p['experiment_key'])!=64)): raise ValueError('Invalid project update')
+    elif a=='stop_paper':
+        if set(p)!= {'trial_id'} or not isinstance(p['trial_id'],str) or len(p['trial_id'])!=64: raise ValueError('Require a trial id')
     elif p: raise ValueError('Talk/conserve take no parameters')
     return dict(raw,parameters=p)
 
@@ -133,7 +156,7 @@ def carry_screen(dataset,pair,cutoff):
     return {'development_only':True,'eligible':False,'mechanism':'constant notional short perpetual funding receipt; hypothetical long spot hedge not simulated','months':len(result),'mean_gross':sum(r['gross_short_perp_funding_per_notional'] for r in result)/len(result),'positive_after_1pct_months':sum(r['illustrative_net_after_1pct_round_trip']>0 for r in result),'monthly':result,'limitations':'Funding cash flows only. Not a tradeable return: excludes changing notional, hedge P&L, basis, margin, liquidation, borrow, availability, taxes and actual fees. No eligibility.'}
 
 
-def research(plan,parts,funding,cutoff):
+def research(plan,parts,funding,cutoff,capture=None):
     a,p=plan['action'],plan['parameters']
     if a=='carry_screen': return carry_screen(funding,p['pair'],cutoff)
     if a=='funding_tail':
@@ -144,6 +167,7 @@ def research(plan,parts,funding,cutoff):
     aligned=cross.align(parts); pair=p['pair']; peer=next(x for x in PAIRS if x!=pair); spec=tree.Spec(**p['spec'])
     parent=tree.Spec((('volatility',168),('volatility',672),('volume_ratio',168),('volume_ratio',672)))
     r=tree.evaluate(aligned[pair],pair,cutoff,parent,spec,other_parts=aligned[peer],horizon=p['horizon'])
+    if capture: capture(r)
     return {'summary':r['summary'],'windows':r['windows'],'dataset_sha256':r['dataset_sha256'],'other_dataset_sha256':r['other_dataset_sha256'],'development_only':True,'eligible':False}
 
 
@@ -155,9 +179,9 @@ def paid_task(path,ident,plan,worker,task):
         with c:
             economy.recover(c)
             a=c.execute('SELECT * FROM economy_agents WHERE id=?',(ident,)).fetchone()
-            if not a or a['state']!='active' or economy.balance(c,ident+':operating')<cfg['research_cents']+cfg['upkeep_cents']: raise ValueError('Agent cannot afford research or is conserving/retired')
+            if not a or a['state']!='active' or economy.balance(c,ident+':operating')<cfg['research_cents']+(0 if economy.table_exists(c,'economy_clock') else cfg['upkeep_cents']): raise ValueError('Agent cannot afford research or is conserving/retired')
             tick=c.execute("INSERT INTO economy_ticks(status,decision) VALUES('running','council_research')").lastrowid
-            economy.upkeep(c,cfg,tick)
+            if not economy.table_exists(c,'economy_clock'): economy.upkeep(c,cfg,tick)
             economy.transfer(c,tick,ident+':operating','spent',cfg['research_cents'],'research',task)
             payload={'council_plan':plan,'source':'council'}
             c.execute('INSERT INTO economy_tasks VALUES(?,?,?,?,?,?)',(task,tick,ident,'running',cfg['research_cents'],pack(payload)))
@@ -190,7 +214,7 @@ def recover_experiments(c,economy_path):
             c.execute('UPDATE council_experiments SET state=?,result=? WHERE key=?',(state,pack(result),r['key']))
 
 
-def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,provider=local_model):
+def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,provider=local_model,activity=None,paid_gate=None):
     from .coordinator import exclusive
     with exclusive(str(Path(path).resolve())+'.turn.lock'),closing(connect(path)) as c:
         with c:
@@ -198,16 +222,17 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
             if linked and linked!=resolved: raise ValueError('Council is bound to a different economic ledger')
             c.execute('UPDATE council_config SET economy_path=?',(resolved,))
             recover_experiments(c,economy_path)
-        messages,through,unread=inbox(c,agent['id']); evidence=[dict(r) for r in c.execute('SELECT agent,state,result FROM council_experiments ORDER BY rowid DESC LIMIT 6')]
+        messages,through,unread=inbox(c,agent['id']); evidence=[dict(r) for r in c.execute('SELECT key,agent,state,result FROM council_experiments ORDER BY rowid DESC LIMIT 6')]
         # Avoid sending long monthly arrays / full reports to local model.
         for e in evidence:
             x=json.loads(e['result']); r=x.get('result',x); e['result']={k:v for k,v in r.items() if k!='monthly'}
-        prompt=pack({'identity':agent['id'],'policy':agent['policy'],'operating_cents':agent['operating_cents'],'state':agent['state'],'objective':'Find economically viable trading mechanisms. Historical improvements are not revenue. Prefer no trade over losing trade. Answer operator questions directly and share useful evidence. Do not repeat known experiments unless a distinct question requires it. Request missing capabilities instead of claiming execution.','tools':{'talk':{},'conserve':{},'directional':{'pair':list(PAIRS),'horizon':[24,72,168,336],'spec':{'features':[['momentum',168]],'method':'ridge','transform':'raw','calibration':'standard'},'note':'Any valid research-tree Spec, no menu/parent mutation requirement. Features: momentum,distance,volatility,rsi,volume_ratio,breakout,other_momentum,other_volatility,relative_strength,cross_correlation. Methods: ridge,shrink,robust,similarity,regime,logistic_up,logistic_downside. Lookbacks: 6,12,24,48,72,120,168,336,504,672,720.'},'funding_tail':{'pair':list(PAIRS),'horizon':[168,336],'rule':['low_level','high_level','falling_funding','rising_funding']},'carry_screen':{'pair':list(PAIRS)},'request_capability':{'capability':'what new mechanism/data/tool','evidence_needed':'how to test it'}},'paid_allowed':allow_paid,'context':context,'recent_messages':[{**r,'body':r['body'][:800]} for r in messages[-12:] if r['id'] not in {u['id'] for u in unread}],'unread_operator_messages':unread,'recent_experiments':evidence,'return_schema':{'action':'one tool name','recipient':'all/operator/alpha/beta/gamma or generation','message':'public response or finding','rationale':'concise decision summary, distinguish assumptions','parameters':{} }})
+        prompt=pack({'identity':agent['id'],'predecessor':agent.get('predecessor'),'policy':agent['policy'],'operating_cents':agent['operating_cents'],'state':agent['state'],'objective':'When operator messages are unread, answer their questions directly in your message and address operator unless delegating. Find economically viable trading mechanisms. Historical improvements are not revenue. Prefer no trade over losing trade. Answer operator questions directly and share useful evidence. Do not repeat known experiments unless a distinct question requires it. Request missing capabilities instead of claiming execution.','tools':{'talk':{},'conserve':{},'directional':{'pair':list(PAIRS),'horizon':[24,72,168,336],'spec':{'features':[['momentum',168]],'method':'ridge','transform':'raw','calibration':'standard'},'note':'Any valid research-tree Spec, no menu/parent mutation requirement. Features: momentum,distance,volatility,rsi,volume_ratio,breakout,other_momentum,other_volatility,relative_strength,cross_correlation. Methods: ridge,shrink,robust,similarity,regime,logistic_up,logistic_downside. Lookbacks: 6,12,24,48,72,120,168,336,504,672,720.'},'funding_tail':{'pair':list(PAIRS),'horizon':[168,336],'rule':['low_level','high_level','falling_funding','rising_funding']},'carry_screen':{'pair':list(PAIRS)},'request_capability':{'capability':'what new mechanism/data/tool','evidence_needed':'how to test it'}},'collaboration_tools':{'delegate':{'recipient':'specific peer','parameters':{'action':'directional/funding_tail/carry_screen/review','parameters':{},'question':'concrete requested work','project_id':'optional integer'}},'accept_task':{'task_id':'integer'},'decline_task':{'task_id':'integer'},'review':{'experiment_key':'64-char stored key'},'verify':{'experiment_key':'64-char peer experiment; paid deterministic rerun on same data'},'create_project':{'title':'short title','hypothesis':'testable economic hypothesis'},'project_update':{'project_id':'integer','update':'findings or next step','state':'open/complete/abandoned (owner closes)','experiment_key':None},'deploy_paper':{'experiment_key':'qualified own experiment key; runtime only; no live orders'},'stop_paper':{'trial_id':'own active trial id; permanently stop and flatten at fresh quote; runtime only'}},'paid_allowed':allow_paid,'context':context,'recent_messages':[{**r,'body':r['body'][:800]} for r in messages[-12:] if r['id'] not in {u['id'] for u in unread}],'unread_operator_messages':unread,'unread_peer_messages':[r for r in messages if r['id']>c.execute('SELECT coalesce(max(inbox_through),0) FROM council_turns WHERE agent=?',(agent['id'],)).fetchone()[0] and r['sender'] not in ('operator','system',agent['id']) and r['recipient'] in (agent['slot'],agent['id'])][:4],'recent_experiments':evidence,'return_schema':{'action':'one tool name','recipient':'all/operator/alpha/beta/gamma or generation','message':'public response or finding','rationale':'concise decision summary, distinguish assumptions','parameters':{} }})
         started=time.monotonic(); cpu=time.process_time()
-        if agent['policy']=='deterministic':
+        if activity: activity('thinking')
+        if agent['policy']=='deterministic' and not (context.get('dialogue_enabled') and (unread or any(r['recipient'] in (agent['id'],agent['slot']) and r['sender'] not in ('operator','system',agent['id']) for r in messages))):
             raw={'action':'conserve','recipient':'operator' if unread else 'all','message':'Deterministic successor: no language-model deliberation; conserving resources.','rationale':'Current policy does not use Ollama.','parameters':{}}; thought=None; source='deterministic'
         else:
-            raw,thought=provider(model,prompt); source='ollama'
+            raw,thought=provider(model,prompt); source='ollama_dialogue' if agent['policy']=='deterministic' else 'ollama'
         wall=time.monotonic()-started; cpu=time.process_time()-cpu
         try: plan=validate_plan(raw)
         except (ValueError,TypeError,KeyError) as exc:
@@ -220,6 +245,64 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
             tid=c.execute('INSERT INTO council_turns(agent,created,inbox_through,plan,reasoning,source,wall_seconds,python_cpu_seconds) VALUES(?,?,?,?,?,?,?,?)',(agent['id'],int(time.time()),through,pack(plan),thought,source,wall,cpu)).lastrowid
             message(c,agent['id'],plan['recipient'],'dialogue',plan['message'])
             if plan['action']=='request_capability': message(c,agent['id'],'all','capability_request',pack(plan['parameters']))
+        assignment=None
+        if plan['action']=='create_project':
+            p=plan['parameters']
+            with c:
+                project=c.execute("INSERT INTO council_projects(owner,title,hypothesis,state,created) VALUES(?,?,?,'open',?)",(agent['id'],p['title'],p['hypothesis'],int(time.time()))).lastrowid
+                message(c,agent['id'],'all','project',f'Project #{project}: {p["title"]} — {p["hypothesis"]}')
+            return {'turn':tid,'agent':agent['id'],'plan':plan,'paid':False,'project':project}
+        if plan['action']=='project_update':
+            p=plan['parameters']; project=c.execute('SELECT * FROM council_projects WHERE id=?',(p['project_id'],)).fetchone()
+            if not project or project['state']!='open': raise ValueError('Project is not open')
+            if p['state']!='open' and project['owner']!=agent['id']: raise ValueError('Only project owner may close it')
+            if p['experiment_key'] and not c.execute("SELECT 1 FROM council_experiments WHERE key=? AND state='complete'",(p['experiment_key'],)).fetchone(): raise ValueError('Referenced experiment is not completed')
+            with c:
+                c.execute('INSERT INTO council_project_updates(project,agent,created,body,evidence) VALUES(?,?,?,?,?)',(p['project_id'],agent['id'],int(time.time()),p['update'],p['experiment_key']))
+                if p['state']!='open': c.execute('UPDATE council_projects SET state=? WHERE id=?',(p['state'],p['project_id']))
+                message(c,agent['id'],'all','project_update',f'Project #{p["project_id"]}: {p["update"]}')
+            return {'turn':tid,'agent':agent['id'],'plan':plan,'paid':False,'project':p['project_id']}
+        if plan['action']=='delegate':
+            live=[a for a in economy.status(economy_path)['agents'] if a['state']!='retired']
+            targets=[a['id'] for a in live if plan['recipient'] in (a['id'],a['slot']) and a['id']!=agent['id']]
+            if len(targets)!=1: raise ValueError('Delegate to a living peer, not yourself')
+            params=plan['parameters']; project=params.get('project_id')
+            if project is not None and not c.execute("SELECT 1 FROM council_projects WHERE id=? AND state='open'",(project,)).fetchone(): raise ValueError('Project is not open')
+            nested=dict(action=params['action'],recipient='all',message=params['question'],rationale=params['question'],parameters=params['parameters'])
+            with c:
+                assignment=c.execute("INSERT INTO council_assignments(requester,assignee,state,plan,created,project_id) VALUES(?,?,'pending',?,?,?)",(agent['id'],targets[0],pack(nested),int(time.time()),project)).lastrowid
+                message(c,agent['id'],targets[0],'assignment',f'Assignment #{assignment}: '+pack(nested))
+            return {'turn':tid,'agent':agent['id'],'plan':plan,'paid':False,'assignment':assignment}
+        if plan['action'] in ('accept_task','decline_task'):
+            assignment=plan['parameters']['task_id']; row=c.execute("SELECT * FROM council_assignments WHERE id=? AND assignee=? AND state='pending'",(assignment,agent['id'])).fetchone()
+            if not row: raise ValueError('Assignment is not pending for this generation')
+            if plan['action']=='decline_task':
+                with c:
+                    c.execute("UPDATE council_assignments SET state='declined',result=? WHERE id=?",(pack(plan),assignment)); message(c,agent['id'],row['requester'],'assignment_result',f'Assignment #{assignment} declined: '+plan['rationale'])
+                return {'turn':tid,'agent':agent['id'],'paid':False,'assignment':assignment}
+            requested=json.loads(row['plan'])
+            if requested['action'] in PAID and (not allow_paid or (paid_gate is not None and not paid_gate())): raise ValueError('Assignment needs an available research budget')
+            accepted=plan; plan=validate_plan(requested)
+            if plan['action']=='review': plan=dict(plan,message=accepted['message'],rationale=accepted['rationale'])
+        if plan['action']=='review':
+            key=plan['parameters']['experiment_key']; row=c.execute("SELECT * FROM council_experiments WHERE key=? AND state='complete'",(key,)).fetchone()
+            if not row or row['agent']==agent['id']: raise ValueError('Review a completed experiment by another generation')
+            result=json.loads(row['result']); check={'experiment':key,'author':row['agent'],'reviewer':agent['id'],'measured':result.get('result',result),'eligible':False,'assessment':plan['rationale'],'reviewer_message':plan['message'],'note':'Peer critique of measured historical evidence, not an independent forward validation.'}
+            with c:
+                message(c,agent['id'],'all','peer_review',pack(check)[:12000])
+                if assignment: c.execute("UPDATE council_assignments SET state='complete',result=? WHERE id=?",(pack(check),assignment))
+            return {'turn':tid,'agent':agent['id'],'paid':False,'review':check}
+        if plan['action']=='verify':
+            key=plan['parameters']['experiment_key']; row=c.execute("SELECT * FROM council_experiments WHERE key=? AND state='complete'",(key,)).fetchone()
+            if not row or row['agent']==agent['id']: raise ValueError('Verify a completed experiment by a different generation')
+            previous=json.loads(row['result']); original=previous.get('council_plan')
+            if not original or original['action'] not in ('directional','funding_tail','carry_screen'): raise ValueError('Only original measured research can be verified')
+            if digest([PROTOCOL,context.get('data_identity'),original['action'],original['parameters']])!=key: raise ValueError('Verification requires original data identity')
+            original=validate_plan(original); evaluator=worker
+            def verification(_):
+                measured=evaluator(original); expected=previous.get('result'); return {'experiment_key':key,'author':row['agent'],'verified_same_data':pack(measured)==pack(expected),'measured':measured,'development_only':True,'eligible':False,'note':'Independent deterministic rerun on the same historical data, not prospective validation.'}
+            worker=verification if worker is not None else None
+        if paid_gate is not None and not paid_gate(): allow_paid=False
         if plan['action'] not in PAID: return {'turn':tid,'agent':agent['id'],'plan':plan,'paid':False}
         if not allow_paid or worker is None:
             with c: message(c,'system',agent['id'],'system','Research proposal recorded, but paid research is not enabled for this run.')
@@ -227,8 +310,12 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
         key=digest([PROTOCOL,context.get('data_identity'),plan['action'],plan['parameters']]); task='council:'+key
         with c:
             if c.execute('SELECT 1 FROM council_experiments WHERE key=?',(key,)).fetchone():
+                if assignment: c.execute("UPDATE council_assignments SET state='duplicate',result=? WHERE id=?",(pack({'experiment':key}),assignment))
                 message(c,'system',agent['id'],'system','Identical experiment already registered. No fee charged.'); return {'turn':tid,'agent':agent['id'],'paid':False,'duplicate':True}
             c.execute('INSERT INTO council_experiments VALUES(?,?,?,?,?,?)',(key,agent['id'],tid,task,'running','{}'))
+        if activity: activity('researching')
+        if assignment:
+            with c: c.execute("UPDATE council_assignments SET state='running',result=? WHERE id=?",(pack({'experiment':key}),assignment))
         try: state,result=paid_task(economy_path,agent['id'],plan,lambda:worker(plan),task)
         except Exception as exc:
             with closing(economy.connect(economy_path,True)) as ec:
@@ -236,6 +323,12 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
             state='interrupted' if charged else 'rejected'; result={'error':str(exc),'prepaid':bool(charged)}
         with c:
             c.execute('UPDATE council_experiments SET state=?,result=? WHERE key=?',(state,pack(result),key))
+            if assignment:
+                c.execute('UPDATE council_assignments SET state=?,result=? WHERE id=?',(state,pack({'experiment':key,'result':result}),assignment))
+                requester=c.execute('SELECT requester FROM council_assignments WHERE id=?',(assignment,)).fetchone()[0]
+                message(c,agent['id'],requester,'assignment_result',f'Assignment #{assignment}: {state}; experiment {key}')
+                project=c.execute('SELECT project_id FROM council_assignments WHERE id=?',(assignment,)).fetchone()[0]
+                if project: c.execute('INSERT INTO council_project_updates(project,agent,created,body,evidence) VALUES(?,?,?,?,?)',(project,agent['id'],int(time.time()),f'Assignment #{assignment} {state}',key if state=='complete' else None))
             summary=result.get('result',result); summary={k:v for k,v in summary.items() if k!='monthly'}
             message(c,agent['id'],'all','measured_result',pack({'action':plan['action'],'state':state,'result':summary})[:12000])
         return {'turn':tid,'agent':agent['id'],'paid':state!='rejected','state':state,'result':result}
@@ -243,7 +336,7 @@ def turn(path,economy_path,agent,model,context,worker=None,allow_paid=False,prov
 
 def snapshot(path):
     with closing(connect(path)) as c:
-        return {'protocol':PROTOCOL,'messages':[dict(r) for r in c.execute('SELECT * FROM council_messages ORDER BY id DESC LIMIT 150')], 'turns':[dict(r,plan=json.loads(r['plan'])) for r in c.execute('SELECT * FROM council_turns ORDER BY id DESC LIMIT 60')], 'experiments':[dict(r,result=json.loads(r['result'])) for r in c.execute('SELECT * FROM council_experiments ORDER BY rowid DESC LIMIT 30')]}
+        return {'protocol':PROTOCOL,'messages':[dict(r) for r in c.execute('SELECT * FROM council_messages ORDER BY id DESC LIMIT 150')], 'turns':[dict(r,plan=json.loads(r['plan'])) for r in c.execute('SELECT * FROM council_turns ORDER BY id DESC LIMIT 60')], 'projects':[dict(r,updates=[dict(u) for u in c.execute('SELECT * FROM council_project_updates WHERE project=? ORDER BY id DESC LIMIT 30',(r['id'],))]) for r in c.execute('SELECT * FROM council_projects ORDER BY id DESC LIMIT 30')] if economy.table_exists(c,'council_projects') else [], 'assignments':[dict(r,plan=json.loads(r['plan']),result=json.loads(r['result']) if r['result'] else None) for r in c.execute('SELECT * FROM council_assignments ORDER BY id DESC LIMIT 50')] if economy.table_exists(c,'council_assignments') else [], 'experiments':[dict(r,result=json.loads(r['result'])) for r in c.execute('SELECT * FROM council_experiments ORDER BY rowid DESC LIMIT 30')]}
 
 
 def render(data,token):
@@ -313,6 +406,11 @@ def main():
         context['data_identity']=digest([x.cutoff,{p:old.fingerprint(parts[p],p) for p in PAIRS},funding.get('events_sha256')]); context['cutoff']=x.cutoff
         worker=lambda plan:research(plan,parts,funding,x.cutoff)
     remaining=x.research_budget; rounds=0
+    from .coordinator import exclusive
+    with exclusive(str(Path(x.db).resolve())+'.runtime.lock'):
+        _legacy_loop(x,context,worker,remaining,rounds)
+
+def _legacy_loop(x,context,worker,remaining,rounds):
     while x.listen or rounds<x.rounds:
         rounds+=1
         for a in economy.status(x.economy)['agents']:
