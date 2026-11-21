@@ -1,6 +1,7 @@
 """v0.30 cost-replay, provenance, and autonomous economic-readiness regression tests."""
 from __future__ import annotations
 from dataclasses import dataclass, asdict
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -55,6 +56,7 @@ class ReviewTests(unittest.TestCase):
                           'train_last_label_end':start-3600,'models':models}]}
         return report,[bars]
 
+    @contextmanager
     def fake_modules(self):
         fake={}
         for name in ('lab','weekly_review','weekly_models','core'):
@@ -64,7 +66,11 @@ class ReviewTests(unittest.TestCase):
         fake['autarky_trade.weekly_review'].account=paper_account
         fake['autarky_trade.weekly_models'].horizon_slots=lambda h:29 if h==24 else (_ for _ in ()).throw(ValueError('invalid horizon'))
         fake['autarky_trade.core'].Costs=Costs
-        return patch.dict(sys.modules,fake)
+        # unittest discovery may have imported the real modules already.
+        # Patch both the module table and cached package attributes.
+        package=sys.modules['autarky_trade']
+        with patch.dict(sys.modules,fake),patch.dict(vars(package),{k.rsplit('.',1)[1]:v for k,v in fake.items()}):
+            yield
 
     def test_cost_replay_identical_trades_and_genuine_shortfall(self):
         report,bars=self.sample()
