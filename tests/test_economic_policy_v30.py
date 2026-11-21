@@ -171,4 +171,33 @@ class ReviewTests(unittest.TestCase):
                 policy.create_review_if_missing(d,{},100)
             self.assertEqual(dest.read_text(),'corrupt')
 
+
+class EngineIntegration(unittest.TestCase):
+    def test_cost_replay_uses_real_chronological_evaluator(self):
+        """Exercise tree -> weekly evaluator -> frozen account cost replay together."""
+        from autarky_trade import lab, cross_asset as cross, research_tree as tree
+        from autarky_trade.core import Bar
+        bars=[]; price=100.
+        for i in range(lab.WARMUP+720*25):
+            end=price*1.0002
+            bars.append(Bar(1700002800+i*3600,price,end,price,end,100.))
+            price=end
+        peer=[Bar(b.ts,b.open*2,b.high*2,b.low*2,b.close*2,b.volume) for b in bars]
+        aligned=cross.align({'XBTUSD':[bars],'ETHUSD':[peer]})
+        cutoff=bars[-1].ts
+        parent=tree.Spec((('momentum',24),))
+        candidate=tree.Spec((('momentum',24),('other_momentum',24)))
+        report=tree.evaluate(aligned['XBTUSD'],'XBTUSD',cutoff,parent,candidate,
+                             now=cutoff+3600,other_parts=aligned['ETHUSD'],horizon=336)
+        result=policy.replay_directional(report,aligned['XBTUSD'],336)
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['windows'],report['windows'])
+        self.assertAlmostEqual(result['scenarios']['legacy_normal']['candidate']['mean_30d_net'],
+                               report['summary']['candidate']['mean_net'])
+        self.assertAlmostEqual(result['scenarios']['legacy_stress']['candidate']['mean_30d_net'],
+                               report['summary']['candidate']['mean_stress'])
+        self.assertLessEqual(result['scenarios']['kraken_taker_proxy']['candidate']['mean_30d_net'],
+                             result['scenarios']['legacy_normal']['candidate']['mean_30d_net'])
+
+
 if __name__=='__main__':unittest.main()
