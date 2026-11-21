@@ -121,10 +121,21 @@ def load_review(home):
         if not all(isinstance(raw.get(k),(int,float)) and math.isfinite(raw[k]) for k in ('capital_usd','daily_operating_usd')) or raw['capital_usd']<=0 or raw['daily_operating_usd']<0:
             raise ValueError('Invalid capital or operating cost in saved review')
         ranked=[]
+        seen=set()
         for r in raw['results']:
+            identity=(r['node'],r['agent'],r['pair'],r['horizon_hours'])
+            if identity in seen: raise ValueError('Duplicate economic research result')
+            seen.add(identity)
             a=r['scenarios']; k=a['kraken_taker']['candidate']; s=a['legacy_stress']['candidate']; l=a['okx_us_proxy']['candidate']
-            if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in (k['mean_30d_net'],k['annual_simple_surplus_usd'],s['mean_30d_net'],l['mean_30d_net'])):
+            if not all(type(v) in (int,float) and math.isfinite(v) for v in (k['mean_30d_net'],k['annual_simple_surplus_usd'],s['mean_30d_net'],l['mean_30d_net'])):
                 raise ValueError('Non-finite economic result')
+            # A stored annual surplus is not independent evidence. Reconcile it
+            # against the monthly account return, the modeled capital, and upkeep.
+            expected=raw['capital_usd']*k['mean_30d_net']*365/30-raw['daily_operating_usd']*365
+            if not math.isclose(k['annual_simple_surplus_usd'],expected,rel_tol=1e-8,abs_tol=1e-7):
+                raise ValueError('Saved annual surplus does not reconcile with account return and costs')
+            if type(k['fills']) is not int or k['fills']<0 or type(r['windows']) is not int or r['windows']<=0:
+                raise ValueError('Invalid trading activity in economic review')
             ranked.append({'node':r['node'],'agent':r['agent'],'pair':r['pair'],'horizon_hours':r['horizon_hours'],
                            'windows':r['windows'],'kraken_taker_30d_net':k['mean_30d_net'],
                            'kraken_taker_annual_surplus_usd':k['annual_simple_surplus_usd'],
@@ -180,9 +191,11 @@ def create_review_if_missing(home, parts, cutoff):
         with os.fdopen(fd,'w',encoding='utf-8') as f:
             json.dump(result,f,indent=2,allow_nan=False)
             f.flush();os.fsync(f.fileno())
-        # The runtime is single-owner; never overwrite a user-generated report.
-        if path.exists(): raise ValueError('Economic review appeared during replay; preserving it')
-        os.replace(tmp,path)
+        # Atomically publish without overwrite. A concurrent manual review
+        # wins cleanly instead of being replaced between an exists check and rename.
+        try: os.link(tmp,path)
+        except FileExistsError:
+            raise ValueError('Economic review appeared during replay; preserving it')
     finally:
         if Path(tmp).exists(): Path(tmp).unlink()
     checked=load_review(home)

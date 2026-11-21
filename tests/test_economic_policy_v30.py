@@ -120,6 +120,22 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(result['positive_operating_surplus'],0)
             self.assertEqual(len(policy.compact(result)['ranked']),1)
 
+    def test_reject_fabricated_surplus_and_duplicate_rows(self):
+        with TemporaryDirectory() as d:
+            source,r=self.fixture(d)
+            destination=source.parent/'economic-review-v29.json'
+            r['results'][0]['scenarios']['kraken_taker']['candidate']['annual_simple_surplus_usd']+=1000
+            destination.write_text(json.dumps(r))
+            out=policy.load_review(d)
+            self.assertFalse(out['valid'])
+            self.assertIn('reconcile',out['reason'])
+            r['results'][0]['scenarios']['kraken_taker']['candidate']['annual_simple_surplus_usd']-=1000
+            r['results'].append(copy.deepcopy(r['results'][0]))
+            destination.write_text(json.dumps(r))
+            out=policy.load_review(d)
+            self.assertFalse(out['valid'])
+            self.assertIn('Duplicate',out['reason'])
+
     def test_stale_source_is_rejected(self):
         with TemporaryDirectory() as d:
             source,r=self.fixture(d); (source.parent/'economic-review-v29.json').write_text(json.dumps(r))
