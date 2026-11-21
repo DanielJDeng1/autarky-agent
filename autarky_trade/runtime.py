@@ -17,10 +17,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
-from . import council, economic_kernel as economy, core
+from . import council, economic_kernel as economy, economic_policy, core
 from .coordinator import exclusive
 
-PROTOCOL='v0.28-runtime-1'
+PROTOCOL='v0.30-runtime-1'
 DAY=86400
 
 
@@ -406,7 +406,13 @@ def api_snapshot(paths):
         if trial: marked+=round(trial['accounts']['candidate_normal']['equity']*100)-l['settled_cents']
     expenses=paths.get('resources')
     actual=economy.actual_expenses(expenses) if expenses and Path(expenses).is_file() else {'recorded':False,'actual_expenses_usd':None}
-    return dict(d,marked_pool_cents=marked,locked_production=locked,actual_expenses=actual,candidates=candidate_list(cp),protocol=PROTOCOL,economy=e,production=p,trade_events=trades,capital_history=capital_history(paths['economy']),peer_profiles=peer_profiles(d,e['agents'],paths['economy']),equity_history=equity_history(cp),operator_queue=operator_queue(cp,e['agents']),runtime=s,events=events,server_time=int(time.time()))
+    feasibility=economic_policy.load_review(paths.get('home',Path(cp).parent))
+    return dict(d,marked_pool_cents=marked,locked_production=locked,actual_expenses=actual,
+                economic_feasibility=feasibility,candidates=candidate_list(cp),protocol=PROTOCOL,
+                economy=e,production=p,trade_events=trades,capital_history=capital_history(paths['economy']),
+                peer_profiles=peer_profiles(d,e['agents'],paths['economy']),
+                equity_history=equity_history(cp),operator_queue=operator_queue(cp,e['agents']),
+                runtime=s,events=events,server_time=int(time.time()))
 
 
 def serve(paths,port,stop):
@@ -482,7 +488,19 @@ def run(paths,model,cutoff,evidence,research_interval=300,poll=30,daily_budget=3
         import socket
         with socket.socket() as probe:
             probe.bind(('127.0.0.1',port))
-        threads=[threading.Thread(target=market_loop,args=(paths,stop,poll),daemon=True),threading.Thread(target=heartbeat,daemon=True),threading.Thread(target=serve,args=(paths,port,stop),daemon=True)]
+        def review_once():
+            # Existing historical work is replayed automatically in the background.
+            # This changes no trading parameters, ledgers or frozen strategies.
+            home=paths.get('home',Path(cp).parent)
+            try:
+                set_state(cp,'economic_review_job',{'state':'running','started':int(time.time())})
+                summary=economic_policy.create_review_if_missing(home,parts,cutoff)
+                set_state(cp,'economic_review_job',{'state':'complete','finished':int(time.time()),'generated':summary['generated']})
+                event(cp,'economic_review',summary)
+            except Exception as exc:
+                set_state(cp,'economic_review_job',{'state':'error','finished':int(time.time()),'error':str(exc)})
+                event(cp,'economic_review_warning',{'error':str(exc)})
+        threads=[threading.Thread(target=market_loop,args=(paths,stop,poll),daemon=True),threading.Thread(target=heartbeat,daemon=True),threading.Thread(target=serve,args=(paths,port,stop),daemon=True),threading.Thread(target=review_once,daemon=True)]
         for t in threads: t.start()
         print(f'Autarky runtime: http://127.0.0.1:{port} (Ctrl+C to stop)',flush=True)
         try:
@@ -521,7 +539,14 @@ def run(paths,model,cutoff,evidence,research_interval=300,poll=30,daily_budget=3
                     used=c.execute("SELECT count(*) FROM council_experiments e JOIN council_turns t ON t.id=e.turn WHERE t.created>=? AND e.state NOT IN ('rejected','duplicate')",(now//DAY*DAY,)).fetchone()[0]
                 set_state(cp,'daily_research',{'day':now//DAY,'used':used,'limit':daily_budget})
                 allowed=job is None and not state.get('research_paused',False) and not state.get('autonomy_paused',False) and used<daily_budget and a['state']=='active'
-                market=state.get('market',{}); context={**base,'market':market,'production_trials':[t for t in trials if t['state'] not in ('complete','stopped') or t['agent']==ident][-8:],'peer_profiles':profiles,'pending_assignments':assignments,'open_projects':[{'id':p['id'],'owner':p['owner'],'title':p['title'],'hypothesis':p['hypothesis'],'updates':p['updates'][:2]} for p in snap['projects'] if p['state']=='open'][:8],'qualified_candidates':[r for r in candidate_list(cp) if r['agent']==ident][:8], 'dialogue_enabled':True,'research_budget_today':max(0,daily_budget-used),'research_worker_busy':job is not None,'market_note':'Current observations are timestamped; stale/missing data is not a live quote. Frozen paper trades execute independently. Do not claim a trade you did not execute.'}
+                feasibility=economic_policy.compact(economic_policy.load_review(paths.get('home',Path(cp).parent)))
+                market=state.get('market',{}); context={**base,'market':market,
+                    'economic_feasibility':feasibility,
+                    'execution_assumptions':{'kraken_spot_taker_fee_bps_per_side':80,
+                       'slippage_bps_per_side_assumed':20,
+                       'higher_cost_stress_fee_bps_per_side':80,
+                       'higher_cost_stress_slippage_bps_per_side':40,
+                       'note':'Cost proxies, not account-specific executions or confirmed fee tier.'},'production_trials':[t for t in trials if t['state'] not in ('complete','stopped') or t['agent']==ident][-8:],'peer_profiles':profiles,'pending_assignments':assignments,'open_projects':[{'id':p['id'],'owner':p['owner'],'title':p['title'],'hypothesis':p['hypothesis'],'updates':p['updates'][:2]} for p in snap['projects'] if p['state']=='open'][:8],'qualified_candidates':[r for r in candidate_list(cp) if r['agent']==ident][:8], 'dialogue_enabled':True,'research_budget_today':max(0,daily_budget-used),'research_worker_busy':job is not None,'market_note':'Current observations are timestamped; stale/missing data is not a live quote. Frozen paper trades execute independently. Do not claim a trade you did not execute.'}
                 def activity(label): set_state(cp,'agent:'+ident,{'state':label,'since':int(time.time())})
                 try:
                     captured={}
@@ -563,11 +588,12 @@ def run(paths,model,cutoff,evidence,research_interval=300,poll=30,daily_budget=3
 
 def main():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument('--home',required=True); p.add_argument('--model',default='qwen3:4b'); p.add_argument('--cutoff',type=int,required=True); p.add_argument('--research-interval',type=int,default=300); p.add_argument('--poll',type=int,default=30); p.add_argument('--daily-budget',type=int,default=3); p.add_argument('--port',type=int,default=8768); p.add_argument('--check',action='store_true',help='Read-only installation and frozen model checks')
-    x=p.parse_args(); h=Path(x.home).resolve(); paths={k:h/(k+'.sqlite') for k in ('council','economy','production')}; paths.update(resources=h/'btc-v2.sqlite',btc=h/'history/btc-hourly-full.csv',eth=h/'history/eth-hourly-full.csv',funding=h/'history/funding-btc-eth-v22.json'); evidence=[f for f in (h/'history/funding-state-v23.json',h/'history/horizon-review-v20.json') if f.exists()]
+    x=p.parse_args(); h=Path(x.home).resolve(); paths={k:h/(k+'.sqlite') for k in ('council','economy','production')};paths['home']=h; paths.update(resources=h/'btc-v2.sqlite',btc=h/'history/btc-hourly-full.csv',eth=h/'history/eth-hourly-full.csv',funding=h/'history/funding-btc-eth-v22.json'); evidence=[f for f in (h/'history/funding-state-v23.json',h/'history/horizon-review-v20.json') if f.exists()]
     if x.check:
         from . import production, multiyear
         checks={'paths':{k:{'path':str(v),'exists':Path(v).is_file()} for k,v in paths.items()},'paper_only':True}
         checks['economy']=economy.status(paths['economy'])['reconciled']
+        checks['economic_feasibility']=economic_policy.compact(economic_policy.load_review(h))
         checks['production_trials']=len(production_status(paths['production'])['trials'])
         checks['history_bars']={k:sum(map(len,multiyear.segments(paths[k],x.cutoff))) for k in ('btc','eth')}
         if Path(paths['production']).is_file():
