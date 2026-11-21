@@ -34,7 +34,7 @@ class CommunityTests(unittest.TestCase):
         m.research(self.path,self.bars,'csv',now=self.now)
         with m.db(self.path) as c:
             rows=list(c.execute('SELECT * FROM trials')); self.assertEqual(len(rows),3)
-            for r in rows: self.assertEqual(json.loads(r['report'])['strategy']['kind'],m.AGENTS[r['agent']])
+            for r in rows: self.assertIn(json.loads(r['report'])['strategy']['kind'],(m.AGENTS[r['agent']],'ridge'))
     def test_pending_cannot_trade_on_holdout(self):
         self.activate(after=self.ts); r=m.tick(self.path,self.rising(),100,101,self.now); self.assertEqual(r['agents']['alpha']['fills'],0)
     def test_tick_idempotent_and_capital_conserved(self):
@@ -65,7 +65,7 @@ class CommunityTests(unittest.TestCase):
     def test_allocation_preserves_nav(self):
         a=Account(cash=275,peak=275,trades=22)
         with m.db(self.path) as c:
-            c.execute('UPDATE agents SET account=?,first_tick=? WHERE id=?',(m.encode(asdict(a)),self.ts-31*86400,'alpha')); c.execute('UPDATE treasury SET last_ts=?,last_bid=100',(self.ts,)); c.commit()
+            c.execute('UPDATE agents SET account=?,first_tick=?,active=?,active_since=?,active_fills=22,active_ticks=745,active_start_nav=1 WHERE id=?',(m.encode(asdict(a)),self.ts-31*86400,m.encode(asdict(Strategy('trend',2,5,'test'))),self.ts-31*86400,'alpha')); c.execute('UPDATE treasury SET last_ts=?,last_bid=100',(self.ts,)); c.commit()
         before=m.status(self.path); r=m.rebalance(self.path,self.now); after=m.status(self.path)
         self.assertEqual(r['status'],'allocated'); self.assertAlmostEqual(before['equity'],after['equity']); self.assertAlmostEqual(before['agents'][0]['nav_return'],after['agents'][0]['nav_return']); self.assertAlmostEqual(before['agents'][0]['net_pnl'],after['agents'][0]['net_pnl'])
         self.assertEqual(m.rebalance(self.path,self.now)['status'],'stopped or cooldown')
@@ -75,6 +75,6 @@ class CommunityTests(unittest.TestCase):
         self.assertFalse(any(a['eligible_for_manual_review'] for a in m.readiness(self.path)['agents']))
     def test_local_model_rejects_invalid_candidates(self):
         with patch.object(m,'request',return_value={'message':{'content':json.dumps({'strategies':[{'fast':2,'slow':10},{'fast':99,'slow':1},{'fast':True,'slow':10}]})}}):
-            c=m.candidates('trend','qwen',self.bars[:500],'alpha',[]); self.assertEqual(len(c),5)
+            c=m.candidates('trend','qwen',self.bars[:500],'alpha',[]); self.assertEqual(len(c),6)
 
 if __name__=='__main__': unittest.main()

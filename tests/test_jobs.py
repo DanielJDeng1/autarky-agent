@@ -20,6 +20,10 @@ class JobTests(unittest.TestCase):
         jobs.schedule(self.path,self.bars,'csv',self.now)
         for i in range(jobs.MAX_ATTEMPTS):
             j=jobs.claim(self.path,'alpha',self.now); self.assertTrue(jobs.finish(self.path,j,error='failure',now=self.now))
+        self.assertEqual(jobs.finalize(self.path)['status'],'waiting for workers')
+        for a in ('beta','gamma'):
+            for i in range(jobs.MAX_ATTEMPTS):
+                j=jobs.claim(self.path,a,self.now); self.assertTrue(jobs.finish(self.path,j,error='failure',now=self.now))
         self.assertEqual(jobs.finalize(self.path)['status'],'failed; holdout consumed'); self.assertEqual(jobs.schedule(self.path,self.bars,'csv',self.now)['status'],'waiting for fresh data')
     def test_no_synthetic_queue(self):
         with self.assertRaises(ValueError): jobs.schedule(self.path,self.bars,'synthetic',self.now)

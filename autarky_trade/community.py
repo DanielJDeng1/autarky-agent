@@ -9,6 +9,10 @@ from pathlib import Path
 import sqlite3
 import time
 
+from .signals import filter_schema
+from .research import assess, identity
+from .models import fit
+from . import paper_audit
 from .core import Account, Costs, Strategy, backtest, kraken, quote, load_csv, synthetic, validate, request
 
 AGENTS = {'alpha': 'trend', 'beta': 'reversion', 'gamma': 'breakout'}
@@ -73,21 +77,79 @@ def config(path):
         return dict(row)
 
 
+def model_proposals(payload, agent):
+    """Require complete JSON answers; never parse the model's reasoning as a proposal."""
+    for budget in (2048, 4096):
+        request_body={**payload, 'options':{**payload['options'], 'num_predict':budget}}
+        response=request('http://127.0.0.1:11434/api/chat',request_body)
+        try:
+            content=response['message']['content']
+            if not isinstance(content,str) or not content.strip():
+                raise ValueError('empty answer')
+            result=json.loads(content)
+            if not isinstance(result,dict) or not isinstance(result.get('strategies'),list) or not isinstance(result.get('predictors',[]),list):
+                raise ValueError('expected strategy and predictor arrays')
+            return result
+        except (KeyError,TypeError,ValueError):
+            reason=response.get('done_reason','unknown') if isinstance(response,dict) else 'unknown'
+    raise RuntimeError(f'Ollama {payload["model"]} returned no valid proposal JSON for {agent} after two attempts (done_reason={reason}); verify model and server')
+
+
 def candidates(family, model, training, agent, prior):
     # Agents have disjoint strategy families; prior reports contain training/validation only.
     defaults=[Strategy(family,f,s,f'{agent}-{f}-{s}') for f,s in [(5,20),(12,48),(8,35),(20,80)]]
+    # Diverse deterministic baselines remain available without a model.
+    defaults[2]=Strategy(family,8,35,f'{agent}-8-35-filtered',({'feature':'volatility','window':20,'op':'lt','threshold':.03},))
+    defaults[3]=Strategy(family,20,80,f'{agent}-20-80-filtered',({'feature':'momentum','window':12,'op':'gt','threshold':-.01},))
+    # Each agent tests a distinct predictive specification, fitted only on the training prefix.
+    window, ridge = {'trend':(20, .1), 'reversion':(12, 1.), 'breakout':(48, .5)}[family]
+    if len(training)>=window+102:
+        artifact=fit(training,window,ridge)
+        defaults.append(Strategy('ridge',2,window,f'{agent}-ridge',(),'Regularized one-bar open-to-open return forecast',artifact))
     if not model: return defaults
     returns=[b.close/a.close-1 for a,b in zip(training,training[1:])]
     summary={'n':len(training),'return':training[-1].close/training[0].close-1,'mean':sum(returns)/len(returns),'volatility':math.sqrt(sum(x*x for x in returns)/len(returns)),'prior_training_validation':prior}
-    schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'}},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
-    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five hypotheses with 2 <= fast < slow <= 100. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
-    proposed=json.loads(r['message']['content'])['strategies']
+    schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'},'filters':filter_schema(),'hypothesis':{'type':'string','maxLength':500}},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
+    schema['properties']['predictors']={'type':'array','maxItems':3,'items':{'type':'object','properties':{'window':{'type':'integer','minimum':4,'maximum':100},'ridge':{'type':'number','minimum':.01,'maximum':100},'threshold':{'type':'number','minimum':0,'maximum':.02},'hypothesis':{'type':'string','maxLength':500}},'required':['window','ridge','threshold'],'additionalProperties':False}}
+    payload={'model':model,'stream':False,'think':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five falsifiable hypotheses with 2 <= fast < slow <= 100. Explain each in hypothesis (max 500 characters): what pattern, why it may persist, and what would disprove it. Avoid repeating failed prior configurations. Optional filters (AND): momentum (fractional return), distance (price/SMA-1), volatility (standard deviation of fractional returns), rsi (0..100); each has window 2..100, op gt/lt, threshold. You may also propose up to three predictors: ridge regression on momentum, SMA distance, volatility and RSI, window 4..100, ridge .01..100, threshold 0..0.02 predicted one-bar return. Justify each hypothesis; model fitting is deterministic on training data only. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':2048}}
+    result=model_proposals(payload, agent); proposed=result['strategies']
     for x in proposed[:5]:
         try:
-            s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}')
-            if s not in defaults: defaults.append(s)
+            s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}',x.get('filters',()),x.get('hypothesis',''))
+            if not any((s.fast,s.slow,s.filters)==(d.fast,d.slow,d.filters) for d in defaults): defaults.append(s)
+        except (KeyError,TypeError,ValueError): continue
+    for x in result.get('predictors',[])[:3]:
+        try:
+            w,reg,threshold=x['window'],x['ridge'],x['threshold']
+            if type(w) is not int or not 4<=w<=100 or type(reg) not in (int,float) or not .01<=reg<=100 or type(threshold) not in (int,float) or not 0<=threshold<=.02: continue
+            artifact=fit(training,w,reg,threshold)
+            s=Strategy('ridge',2,w,f'{agent}-ridge-{w}',(),x.get('hypothesis',''),artifact)
+            if not any(identity(s)==identity(d) for d in defaults): defaults.append(s)
         except (KeyError,TypeError,ValueError): continue
     return defaults
+
+
+def same_strategy(left, right):
+    if not left or not right: return False
+    a,b=Strategy(**json.loads(left)),Strategy(**json.loads(right))
+    return identity(a)==identity(b)
+
+
+FORWARD_FREEZE_SECONDS = 60*86400
+
+
+def stage_candidate(c, agent, strategy, holdout_end):
+    """Do not reset a forward trial merely because a new backtest looks good."""
+    r=c.execute('SELECT * FROM agents WHERE id=?',(agent,)).fetchone()
+    t=c.execute('SELECT last_ts,stopped FROM treasury').fetchone()
+    if t['stopped'] or Account(**json.loads(r['account'])).stopped: return 'risk stopped'
+    proposed=encode(strategy)
+    if any(same_strategy(proposed,old) for old in (r['active'],r['pending'])): return 'unchanged'
+    if r['pending']: return 'pending candidate already frozen'
+    if r['active'] and r['active_since'] is not None and t['last_ts']-r['active_since']<FORWARD_FREEZE_SECONDS:
+        return 'active forward trial frozen'
+    c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(proposed,holdout_end,agent))
+    return 'staged'
 
 
 def research(path, bars, source, model=None, now=None):
@@ -98,48 +160,50 @@ def research(path, bars, source, model=None, now=None):
     if source!='synthetic' and bars[-1].ts+cfg['interval']*60>now: raise ValueError('History contains an incomplete/future candle')
     if source=='synthetic':
         # No synthetic evidence is written into a real community's research ledger.
-        return {'status':'synthetic demonstration only','reports':{a:assess(bars,candidates(f,None,bars[:int(len(bars)*.6)],a,[]),int(len(bars)*.8)) for a,f in AGENTS.items()}}
+        return {'status':'synthetic demonstration only','reports':{a:assess(bars,candidates(f,None,bars[:int(int(len(bars)*.8)*.75)],a,[]),int(len(bars)*.8)) for a,f in AGENTS.items()}}
     end=bars[-1].ts
     cutoff=next((i for i,b in enumerate(bars) if b.ts>cfg['last_holdout']),len(bars))
     hold=max(int(len(bars)*.8),cutoff)
     if len(bars)-hold<MIN_TEST: return {'status':'waiting for new unseen data','new_test_bars':len(bars)-hold,'required':MIN_TEST}
     train_end=int(hold*.75)
     with db(path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        current=c.execute('SELECT last_holdout,stopped FROM treasury').fetchone()
+        if current['stopped']: return {'status':'stopped'}
+        if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='batches'").fetchone() and c.execute("SELECT id FROM batches WHERE state='open'").fetchone(): raise ValueError('Queued research batch open; finalize it first')
+        if current['last_holdout']!=cfg['last_holdout']: raise ValueError('Research state changed; retry with fresh data')
         prior={}
         for a in AGENTS:
             row=c.execute('SELECT report FROM trials WHERE agent=? ORDER BY round_id DESC LIMIT 1',(a,)).fetchone()
             prior[a]=json.loads(row[0])['candidates'][:3] if row else []
-    reports={a:assess(bars,candidates(f,model,bars[:train_end],a,prior[a]),hold) for a,f in AGENTS.items()}
+        c.commit()
+    # Proposal generation sees only training data. Do not burn unseen test data if
+    # Ollama fails before any assessment. No SQLite write lock during inference.
+    plans={a:candidates(f,model,bars[:train_end],a,prior[a]) for a,f in AGENTS.items()}
     with db(path) as c:
         c.execute('BEGIN IMMEDIATE')
-        current=c.execute('SELECT last_holdout FROM treasury').fetchone()[0]
+        current=c.execute('SELECT last_holdout,stopped FROM treasury').fetchone()
+        if current['stopped']: return {'status':'stopped'}
         if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='batches'").fetchone() and c.execute("SELECT id FROM batches WHERE state='open'").fetchone(): raise ValueError('Queued research batch open; finalize it first')
-        if current!=cfg['last_holdout']: raise ValueError('Research state changed; retry with fresh data')
+        if current['last_holdout']!=cfg['last_holdout']: raise ValueError('Research state changed; retry with fresh data')
+        # Consume before any assessment, including crashes or failed evaluation.
+        c.execute('UPDATE treasury SET last_holdout=?',(end,))
+        event(c,'holdout_reserved',{'start':bars[hold].ts,'end':end,'source':source}); c.commit()
+    reports={a:assess(bars,plans[a],hold) for a in AGENTS}
+    with db(path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        current=c.execute('SELECT last_holdout,stopped FROM treasury').fetchone()
+        if current['last_holdout']!=end or current['stopped']:
+            raise ValueError('Research superseded or stopped; holdout remains consumed')
         rid=c.execute('INSERT INTO rounds(created,source,test_start,test_end,observations) VALUES(?,?,?,?,?)',(now,source,bars[hold].ts,end,len(bars))).lastrowid
         for a,r in reports.items():
             c.execute('INSERT INTO trials VALUES(?,?,?)',(rid,a,encode(r)))
             if r['eligible']:
-                current_agent=c.execute('SELECT active,pending FROM agents WHERE id=?',(a,)).fetchone()
-                proposed=encode(r['strategy'])
-                if proposed not in (current_agent['active'],current_agent['pending']):
-                    c.execute('UPDATE agents SET pending=?,pending_after=? WHERE id=?',(proposed,end,a))
+                event(c,'candidate_decision',{'agent':a,'round':rid,'decision':stage_candidate(c,a,r['strategy'],end)})
         c.execute('UPDATE treasury SET last_holdout=?',(end,))
         event(c,'research',{'round':rid,'source':source,'model':model,'eligible':[a for a,r in reports.items() if r['eligible']]})
         c.commit()
     return {'status':'researched','round':rid,'test_start':bars[hold].ts,'test_end':end,'reports':reports}
-
-
-def assess(bars, strategies, hold):
-    split=int(hold*.75); n=len(bars)
-    rows=[]
-    for s in strategies:
-        train=backtest(bars,s,COSTS,100,split); val=backtest(bars,s,COSTS,split,hold)
-        rows.append({'strategy':asdict(s),'train':train,'validation':val})
-    rows.sort(key=lambda r:(r['validation']['return'],r['train']['return']),reverse=True)
-    winner=rows[0]; s=Strategy(**winner['strategy'])
-    test=backtest(bars,s,COSTS,hold,n); stress=backtest(bars,s,Costs(80,20),hold,n)
-    eligible=all(r['return']>0 and r['trades']>=4 and r['drawdown']<MAX_DRAWDOWN and not r['stopped'] for r in (winner['train'],winner['validation'],test,stress))
-    return {'strategy':asdict(s),'candidates':rows,'test':test,'stress':stress,'eligible':eligible,'note':'Exploratory gate; three simultaneous hypotheses, not proof of statistical edge.'}
 
 
 def tick(path, bars, bid, ask, now=None):
@@ -149,19 +213,36 @@ def tick(path, bars, bid, ask, now=None):
     if not 0<=now-end<=cfg['interval']*60+120 or not math.isfinite(bid) or not math.isfinite(ask) or not 0<bid<=ask: raise ValueError('Stale candle or invalid quote')
     with db(path) as c:
         c.execute('BEGIN IMMEDIATE'); t=c.execute('SELECT * FROM treasury').fetchone()
-        if ts<=t['last_ts']:
-            if ts==t['last_ts'] and t['stopped']:
-                # A manual halt can arrive between candle closes. Exit on the next poll.
-                changed=False
-                for r in c.execute('SELECT * FROM agents').fetchall():
-                    a=Account(**json.loads(r['account'])); before=a.trades
-                    a.fill(False,bid,ask,COSTS); a.mark(bid)
-                    if a.trades!=before:
-                        changed=True; c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,r['id']))
-                if changed:
-                    c.execute('UPDATE treasury SET last_bid=?',(bid,)); event(c,'halt_flatten',{'candle':ts,'bid':bid,'ask':ask}); c.commit()
-                    return {'status':'halted and flattened','ts':ts}
+        if ts<t['last_ts']:
             return {'status':'already processed','ts':ts}
+        paper_audit.setup(c)
+        quote_id=paper_audit.record_quote(c,ts,now,bid,ask)
+        if quote_id is None: return {'status':'older quote ignored','ts':ts}
+        if ts==t['last_ts']:
+            # Quotes can move sharply between candle closes. Revalue and enforce risk,
+            # but never execute a new strategy entry or count another observation.
+            rows=list(c.execute('SELECT * FROM agents ORDER BY id'))
+            states={r['id']:Account(**json.loads(r['account'])) for r in rows}
+            pre=t['reserve']+sum(a.equity(bid) for a in states.values())
+            peak=max(t['peak'],pre); stopped=bool(t['stopped']) or pre<=peak*(1-MAX_DRAWDOWN)
+            changed=False
+            for name,a in states.items():
+                before=a.trades; a.mark(bid)
+                if stopped or a.stopped: paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'portfolio_stop' if stopped else 'agent_stop'); a.mark(bid)
+                changed=changed or a.trades!=before
+                c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
+            equity=t['reserve']+sum(a.equity(bid) for a in states.values())
+            if equity<=peak*(1-MAX_DRAWDOWN) and not stopped:
+                stopped=True
+                for name,a in states.items():
+                    before=a.trades; paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'portfolio_stop'); a.mark(bid)
+                    changed=changed or a.trades!=before
+                    c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
+            c.execute('UPDATE treasury SET last_bid=?,peak=?,stopped=?',(bid,peak,int(stopped)))
+            if stopped and not t['stopped']: event(c,'portfolio_stop',{'candle':ts,'bid':bid,'intrabar':True})
+            if changed: event(c,'halt_flatten' if stopped else 'agent_risk_flatten',{'candle':ts,'bid':bid,'ask':ask})
+            c.commit()
+            return {'status':'halted and flattened' if changed and stopped else 'risk flattened' if changed else 'already processed','ts':ts}
         rows=list(c.execute('SELECT * FROM agents ORDER BY id'))
         states={r['id']:Account(**json.loads(r['account'])) for r in rows}
         pre=t['reserve']+sum(a.equity(bid) for a in states.values()); peak=max(t['peak'],pre)
@@ -175,8 +256,9 @@ def tick(path, bars, bid, ask, now=None):
                 active,after,pending,pa=pending,pa,None,None
                 active_since=ts; active_fills=0; active_ticks=0; active_start_nav=a.cash/r['shares']
             # If candidate is pending, unwind existing strategy before switching; no overlapping positions.
-            signal=bool(active and ts>after and not pending and not stopped and not a.stopped and Strategy(**json.loads(active)).signal([b.close for b in bars]))
-            before=a.trades; a.fill(signal,bid,ask,COSTS); a.mark(bid)
+            signal=bool(active and ts>after and not (pending and ts>pa) and not stopped and not a.stopped and Strategy(**json.loads(active)).signal([b.close for b in bars]))
+            before=a.trades; paper_audit.fill(c,quote_id,name,a,signal,bid,ask,COSTS,'portfolio_stop' if stopped else 'agent_stop' if a.stopped else 'strategy_switch' if pending and ts>pa else 'strategy_signal'); a.mark(bid)
+            if a.stopped: paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'agent_stop'); a.mark(bid); signal=False
             active_fills+=a.trades-before
             active_ticks+=int(bool(active))
             details[name]={'equity':a.equity(bid),'signal':signal,'fills':a.trades-before,'active':json.loads(active) if active else None}
@@ -186,7 +268,7 @@ def tick(path, bars, bid, ask, now=None):
         if equity<=peak*(1-MAX_DRAWDOWN) or stopped:
             stopped=True
             for name,a in states.items():
-                before=a.trades; a.fill(False,bid,ask,COSTS); a.mark(bid)
+                before=a.trades; paper_audit.fill(c,quote_id,name,a,False,bid,ask,COSTS,'portfolio_stop'); a.mark(bid)
                 details[name].update(equity=a.equity(bid),signal=False,fills=details[name]['fills']+a.trades-before)
                 c.execute('UPDATE agents SET account=?,active_fills=active_fills+? WHERE id=?',(encode(asdict(a)),a.trades-before,name))
             equity=t['reserve']+sum(a.equity(bid) for a in states.values())
@@ -208,9 +290,9 @@ def rebalance(path, now=None):
         if not t['last_ts'] or not 0<=now-(t['last_ts']+t['interval']*60)<=t['interval']*60+120: return {'status':'stale market; no allocation'}
         states={r['id']:Account(**json.loads(r['account'])) for r in rows}
         if any(a.units for a in states.values()): return {'status':'wait until all portfolios flat'}
-        eligible=[r for r in rows if r['first_tick'] is not None and t['last_ts']-r['first_tick']>=30*86400 and states[r['id']].trades>=20 and not states[r['id']].stopped and states[r['id']].cash/r['shares']>1]
+        eligible=[r for r in rows if r['active'] and not r['pending'] and r['active_since'] is not None and t['last_ts']-r['active_since']>=30*86400 and r['active_fills']>=20 and r['active_ticks']>=.95*(1+(t['last_ts']-r['active_since'])/(t['interval']*60)) and r['active_start_nav'] and not states[r['id']].stopped and states[r['id']].cash/r['shares']/r['active_start_nav']>1]
         if not eligible: return {'status':'insufficient positive forward evidence'}
-        best=max(eligible,key=lambda r:states[r['id']].cash/r['shares']-1-states[r['id']].drawdown)
+        best=max(eligible,key=lambda r:states[r['id']].cash/r['shares']/r['active_start_nav']-1-states[r['id']].drawdown)
         a=states[best['id']]; total=t['reserve']+sum(x.cash for x in states.values())
         amount=max(0,min(total*.05,t['reserve']-total*.15,total*.40-a.cash))
         if amount<.01: return {'status':'no available allocation'}
@@ -225,6 +307,7 @@ def rebalance(path, now=None):
 
 def status(path):
     with db(path) as c:
+        c.execute('BEGIN')
         t=dict(c.execute('SELECT * FROM treasury').fetchone()); agents=[]
         for r in c.execute('SELECT * FROM agents ORDER BY id'):
             a=Account(**json.loads(r['account'])); equity=a.equity(t['last_bid'] or 0)
@@ -239,7 +322,7 @@ def main():
     r=sub.add_parser('research'); r.add_argument('--source',choices=['synthetic','csv','kraken'],default='kraken'); r.add_argument('--csv'); r.add_argument('--model')
     d=sub.add_parser('run'); d.add_argument('--model'); d.add_argument('--poll',type=int,default=60); d.add_argument('--research-hours',type=int,default=24); d.add_argument('--once',action='store_true'); d.add_argument('--paper-only',action='store_true')
     rl=sub.add_parser('research-loop'); rl.add_argument('--model'); rl.add_argument('--hours',type=int,default=24); rl.add_argument('--once',action='store_true')
-    sub.add_parser('status'); sub.add_parser('rebalance'); sub.add_parser('history'); sub.add_parser('trials'); sub.add_parser('stop'); sub.add_parser('readiness')
+    sub.add_parser('status'); sub.add_parser('rebalance'); sub.add_parser('history'); sub.add_parser('trials'); sub.add_parser('stop'); sub.add_parser('readiness'); j=sub.add_parser('journal'); j.add_argument('--limit',type=int,default=30)
     x=p.parse_args()
     def out(v): print(json.dumps(v,indent=2,allow_nan=False),flush=True)
     if x.cmd=='init': init(x.db,x.pair,x.interval,x.capital); out(status(x.db)); return
@@ -250,22 +333,26 @@ def main():
             c.execute('BEGIN IMMEDIATE'); c.execute('UPDATE treasury SET stopped=1'); event(c,'operator_stop',{'note':'Paper positions will flatten at next fresh quote'}); c.commit()
         out({'status':'stopped; run paper loop to flatten'}); return
     if x.cmd=='readiness': out(readiness(x.db)); return
+    if x.cmd=='journal': out(paper_audit.report(x.db,x.limit)); return
     if x.cmd=='trials':
         with db(x.db) as c: out([{'round':r['round_id'],'agent':r['agent'],'report':json.loads(r['report'])} for r in c.execute('SELECT * FROM trials ORDER BY round_id DESC,agent LIMIT 30')]); return
     if x.cmd=='history':
         with db(x.db) as c: out([dict(r) for r in c.execute('SELECT * FROM events ORDER BY id DESC LIMIT 100')]); return
     cfg=config(x.db)
+    from . import archive
     if x.cmd=='research':
         if x.source=='csv' and not x.csv: p.error('--csv required')
         if x.source=='synthetic' and cfg['interval']!=60: p.error('synthetic uses hourly bars')
         bars=synthetic() if x.source=='synthetic' else load_csv(x.csv,cfg['interval']*60) if x.source=='csv' else kraken(cfg['pair'],cfg['interval'])
+        if x.source!='synthetic':
+            archive.ingest(x.db,bars,x.source); bars=archive.latest(x.db)
         out(research(x.db,bars,x.source,x.model)); return
     if x.cmd=='research-loop':
         if x.hours<1: p.error('hours must be >=1')
         while True:
             try:
                 if status(x.db)['stopped']: out({'status':'stopped'}); break
-                out(research(x.db,kraken(cfg['pair'],cfg['interval']),'kraken',x.model))
+                out(research(x.db,archive.sync(x.db),'kraken',x.model))
             except (OSError,ValueError,RuntimeError,KeyError,TypeError,sqlite3.Error) as e:
                 out({'status':'research skipped','error':str(e)})
                 if x.once: raise
@@ -278,8 +365,9 @@ def main():
         try:
             bars=kraken(cfg['pair'],cfg['interval']); bid,ask=quote(cfg['pair']); out(tick(x.db,bars,bid,ask)); out(rebalance(x.db))
             if not x.paper_only and time.time()>=next_research and not status(x.db)['stopped']:
+                next_research=time.time()+300  # Retry a failed research cycle in five minutes.
+                archive.ingest(x.db,bars,'kraken'); out(research(x.db,archive.latest(x.db),'kraken',x.model))
                 next_research=time.time()+x.research_hours*3600
-                out(research(x.db,bars,'kraken',x.model))
         except (OSError,ValueError,RuntimeError,KeyError,TypeError,sqlite3.Error) as e:
             out({'status':'cycle skipped','error':str(e)})
             if x.once: raise

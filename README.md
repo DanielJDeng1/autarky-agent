@@ -1,8 +1,67 @@
 # Autarky — autonomous trading research community
 
-**v0.3.0 · paper trading only · Python 3.11+ · Ollama optional · SQLite**
+**v0.11.0 · paper research + separate operator-controlled live pilot · Python 3.11+ · Ollama optional · SQLite**
 
 Conway-inspired economic selection for a population of trading research agents. Alpha researches trends, Beta mean reversion, Gamma breakouts. Each can run in its own process, maintains persistent research and paper-account state, and receives resources according to observed performance. The local model proposes bounded strategy parameters; deterministic code performs all calculations and trading decisions. No paid AI API is required. This is experimental quantitative research software, not a profitable trading system or a financial recommendation.
+
+## v0.11 — cost-aware research laboratory
+
+See [RESEARCH_LAB_V11.md](RESEARCH_LAB_V11.md) for the methodology and Windows setup. A separate development-only lab supports up to 100,000 contiguous hourly BTC/ETH bars, executable entry/exit policies, holding periods and cooldowns, rolling multi-hour ridge forecasts, cost/stress and gross-path diagnostics, and matched threshold comparisons. `lab_paper` runs a manually selected frozen policy in an isolated forward-paper ledger. Neither module can authorize live trading. Existing research and execution databases remain unchanged.
+
+## v0.10 — bounded live execution pilot
+
+See [LIVE_PILOT_V10.md](LIVE_PILOT_V10.md) for the complete operating guide. A separate live ledger can arm one frozen BTC/USD or ETH/USD strategy only after a completed, passing single-market prospective final evaluation. It requires a dedicated USD-only account, restricted API key, explicit operator confirmation for every real IOC limit order, hard notional and loss limits, durable intents and exchange-confirmed reconciliation. It is not an autonomous live trading loop. No real orders were placed during development; no profit or operational readiness is established. The research, paper portfolio and v0.9 validation tools remain independent and cannot place live orders.
+
+## v0.9 — authenticated exchange validation gateway
+
+See [EXCHANGE_GATEWAY_V09.md](EXCHANGE_GATEWAY_V09.md) for the complete setup. The gateway has a separate durable intent database, operator approval, Kraken Spot REST signing, preflight/after-validation account reconciliation and read-only order/fill diagnostics. Every order request uses `validate=true`; no real order, cancellation, transfer or withdrawal is implemented. Existing paper processes remain independent.
+
+## v0.8 — unified multi-market paper portfolio
+
+See [PORTFOLIO_V08.md](PORTFOLIO_V08.md) for the complete setup, risk limits, accounting and migration decisions. The new portfolio engine registers frozen eligible trials from BTC and ETH research databases into a separate shared paper treasury, checks synchronized quotes and aggregate exposure, records simulated executions and transfers, and redistributes flat cash using forward strategy NAV. Existing research balances are not deposits into the portfolio. No live orders, credentials, or actual revenue.
+
+## v0.6 — predictive research and resource accounting
+
+See [QUANT_METHODOLOGY.md](QUANT_METHODOLOGY.md) for the research protocol, literature, limitations and commands. Each research agent now includes CPU-trained ridge predictors and can propose bounded model hyperparameters through Ollama. Model artifacts are reproducible, frozen, and evaluated chronologically. Trial reports include rolling-origin refit diagnostics for a selected predictor, paired block-bootstrap uncertainty estimates and unique candidate counts. The paper simulator checks opening gaps before execution and benchmarks share the same simulator. Queued jobs renew leases and record resource usage; actual costs are recorded separately from simulated P&L with `python -m autarky_trade.resources status`. No real trading. Earlier release descriptions below are historical where they differ from v0.6.
+
+## v0.7 — independent final evaluation and research-slot allocation
+
+See [FINAL_EVALUATION.md](FINAL_EVALUATION.md) for the full operator workflow, research literature, protocol, constraints and upgrade guidance. A separate, operator-owned evaluator freezes one eligible BTC and/or ETH strategy per market, registers an exact future evaluation interval, and computes a fixed-allocation portfolio against a cost-matched passive benchmark and stressed costs. Final intervals are one-shot and cannot overlap earlier reserved windows in that ledger. Sealed historical tests are diagnostics only. Prospective review eligibility is not live authorization.
+
+Queued research now accepts `--slots 1|2|3` (default three). The coordinator allocates slots using fresh current-strategy forward evidence and exploration rotation. Completed results survive other workers' failures; `python -m autarky_trade.jobs abandon` closes a stuck batch without losing completed research. No real orders, pooled cross-market live treasury, or proven profitability.
+
+## v0.5 — audit and hypothesis-driven research
+
+See [AUDIT_V05.md](AUDIT_V05.md) for the detailed audit, fixes, remaining design risks and upgrade guidance. The research gate now uses three validation subwindows, ranks pretest-pass candidates first, checks passive risk-adjusted performance, and models an additional historical half-spread proxy. Queued workers freeze proposals before evaluation; reports include the protocol, dataset fingerprint and per-candidate evidence. The optional model can propose a falsifiable hypothesis. Active forward strategies are frozen for 60 days, pending candidates cannot be overwritten, and capital allocation requires current-strategy evidence. Every fresh quote checks risk, even on an already processed candle. Paper only. The v0.4 description below is historical where it differs from v0.5.
+
+## v0.4 — quantitative research expansion
+
+This release remains **paper-only**. Existing v0.3 SQLite databases remain compatible. Old strategy JSON lacking `filters` is interpreted as an empty list; unchanged strategies retain their performance records.
+
+- The local model proposes up to three AND-combined close-price filters on each agent's base rule: momentum (fractional return), distance from SMA, return volatility, and simple-window RSI. All fields and thresholds are validated. No generated Python or shell code runs. Deterministic defaults now include two filtered variants per agent.
+- The selected candidate is compared against cash, an allocation-matched buy-and-hold reference, and 31 seeded random-timing paths calibrated on training signal occupancy and turnover. Approval additionally requires beating the random 75th percentile. These are descriptive comparisons, not significance tests; legacy trial reports retain their original gates.
+- Synchronous research consumes its holdout before evaluation, like the job queue. A failed inference or crash can burn an interval without a result; this prevents inadvertent holdout reuse.
+- The SQLite market archive retains closed candles across sessions. Research uses the latest contiguous suffix, capped at 20,000 candles. Exact duplicates are ignored, conflicting overlapping bars abort ingestion, and gaps are never interpolated. A CSV is operator-supplied: verify its pair, provenance, and time interval.
+
+```bash
+python -m autarky_trade.community init
+python -m autarky_trade.archive import path/to/XBTUSD_60.csv
+python -m autarky_trade.archive sync
+python -m autarky_trade.archive status
+python -m autarky_trade.jobs coordinate --loop --poll 300
+```
+
+Importing a CSV is optional but recommended for long-history research; synchronization pulls the recent Kraken window and appends it. If overlapping historical and exchange candles disagree, investigate the source instead of overwriting used history. The archive belongs to the database's configured market and interval.
+
+Start the three research workers and paper trader as documented below. Open a separate terminal for the new read-only monitor:
+
+```bash
+python -m autarky_trade.dashboard
+```
+
+Visit http://127.0.0.1:8765 to inspect paper equity, agent portfolios, archive coverage, latest trial benchmarks, readiness, and recent events. The dashboard serves a JSON view at `/api/status`, refreshes every 30 seconds, and binds only to localhost. Do not expose it publicly. Supply `--db` before the subcommand in archive/community/jobs, or before `--port` for dashboard, to select a different database.
+
+The research language is deliberately bounded. Arbitrary strategy-code generation, ML model training, multiple markets per portfolio, real exchange execution, and proven profitability are not implemented. The next milestone is richer independent experiments and an isolated, auditable execution service, with real trading gated on forward evidence and operator approval.
 
 ## 1. Quick start (Windows PowerShell, macOS, Linux)
 
@@ -47,7 +106,7 @@ python -m autarky_trade.jobs worker --agent gamma --model qwen3:4b --loop
 python -m autarky_trade.community run --paper-only
 ```
 
-On a small GPU, start each worker once without `--loop`, one at a time, or run one worker process at a time in rotation; simultaneous Ollama requests may queue and consume memory. A worker claims only its own job. Its lease expires after ten minutes; crashed jobs can be reclaimed, with up to three attempts. A stale worker cannot publish after losing a lease. The coordinator commits a batch only when all three reports complete; a failed batch consumes the holdout, preventing optimistic retry against the same test period. The latest results may take days to refresh because fresh data is required. The portfolio can keep running even while the research agents are busy or stopped. Use Ctrl+C to stop processes; SQLite state persists.
+On a small GPU, start each worker once without `--loop`, one at a time, or run one worker process at a time in rotation; simultaneous Ollama requests may queue and consume memory. A worker claims only its own job. Its lease expires after ten minutes; crashed jobs can be reclaimed, with up to three attempts. A stale worker cannot publish after losing a lease. The coordinator finalizes when all selected jobs are terminal, preserving completed reports even when other agents fail. An abandoned or failed batch still consumes its holdout, preventing optimistic retry against the same test period. Use jobs abandon if a missing worker prevents completion. The latest results may take days to refresh because fresh data is required. The portfolio can keep running even while the research agents are busy or stopped. Use Ctrl+C to stop processes; SQLite state persists.
 
 One-off queued research from a local CSV:
 
@@ -79,13 +138,13 @@ python -m autarky_trade.community research --source csv --csv history/btc-hourly
 3. Backtests use signals from prior closed candles, fill at next open with assumed fees and slippage, and mark to market. The validation return ranks candidates; only each agent's winner receives a test and doubled-cost stress test. Require positive training, validation, test and stress returns, >=4 fills each, <8% drawdown, and no stop.
 4. Successful candidates become pending and may start paper trading only on a candle strictly after the holdout. Existing positions are closed before a changed strategy is activated. An identical re-selected strategy retains its forward record. Rejections do not automatically retire an already active strategy; its independent risk controls still apply.
 
-The gate is intentionally exploratory. Three simultaneous candidates, repeated experiments, finite data and regime changes mean a positive backtest is **not** proof of an edge. No p-value, multiple-testing adjustment, benchmark outperformance requirement, exchange order book replay, liquidity model, or cross-validation across multiple regimes is implemented. A future promotion process must add those checks. Store separate untouched final evaluation data outside the lab before changing algorithms.
+The gate is intentionally exploratory. Three simultaneous candidates, repeated experiments, finite data and regime changes mean a positive backtest is **not** proof of an edge. No formal p-value, multiple-testing adjustment, exchange order book replay, liquidity model, or cross-validation across multiple regimes is implemented. v0.5 adds three chronological validation windows and descriptive passive/random benchmark gates. A future promotion process must add those checks. Store separate untouched final evaluation data outside the lab before changing algorithms.
 
 ## 4. Paper economy and risk
 
 Each agent owns an independent simulated spot account; no shorts or leverage. A single position uses at most 25% of its available cash at entry. Orders are filled using a fresh public bid/ask observed by the process, plus 40 bps assumed fees and 10 bps extra slippage per side. These are configurable only in the older v0.2 path; community costs are pinned to prevent silently changing assumptions. Actual exchange fees, spreads and market impact differ. A candle is consumed once per market, and a transaction writes all accounts and the tick atomically. Missed candles are not replayed at fictional historical prices. Bid/ask quotes have no exchange-provided timestamp here; freshness is inferred from fetching them and the closed-candle clock. This is a simulation, not a realistic fill guarantee.
 
-A per-agent 8% maximum observed drawdown stops that agent; a portfolio-wide 8% observed drawdown latches the global stop and flattens positions at the observed simulated bid. Stops are checked on new closed candles, not continuously intrabar. A fast crash could exceed the threshold. The reserve cannot be spent on orders. The founder can allocate up to 5% of total equity from the reserve once per week, only when all agents are flat and the winning agent has at least 30 days since first activation, 20 fills, positive cumulative flow-adjusted return, and no risk stop. It retains at least 15% reserve and caps the receiving agent at 40% of equity at allocation time. Allocation uses share issuance at current NAV so transfers do not manufacture profits. Capital grows/shrinks with simulated P&L; no bank or exchange balance is connected. It does not yet withdraw capital from underperformers or spawn new agents automatically.
+A per-agent 8% maximum observed drawdown stops that agent; a portfolio-wide 8% observed drawdown latches the global stop and flattens positions at the observed simulated bid. Stops are checked on every fresh quote, including between candle closes; there is no continuous exchange-side stop. A fast crash could exceed the threshold. The reserve cannot be spent on orders. The founder can allocate up to 5% of total equity from the reserve once per week, only when all agents are flat and the winning agent has at least 30 days on the current strategy, 20 current-strategy fills, 95% candle coverage, positive current-strategy flow-adjusted return, and no risk stop. It retains at least 15% reserve and caps the receiving agent at 40% of equity at allocation time. Allocation uses share issuance at current NAV so transfers do not manufacture profits. Capital grows/shrinks with simulated P&L; no bank or exchange balance is connected. It does not yet withdraw capital from underperformers or spawn new agents automatically.
 
 ```sh
 python -m autarky_trade.community status
@@ -107,7 +166,7 @@ The original single-agent interface is retained (`python -m autarky_trade resear
 
 ## 6. Real trading roadmap — not implemented in this release
 
-No authenticated exchange endpoint, API key, wallet, real order submission, or live balance reconciliation exists in v0.3. No money can move. This is intentional: before real money is introduced the system needs evidence and a hardened execution boundary, not merely a `--live` switch.
+No authenticated exchange endpoint, API key, wallet, real order submission, or live balance reconciliation exists in v0.7. No money can move. This is intentional: before real money is introduced the system needs evidence and a hardened execution boundary, not merely a `--live` switch.
 
 1. Collect out-of-sample evidence across multiple years and regimes; compare against cash and passive BTC/ETH exposure of comparable risk. Account for costs and inference/electricity, benchmark-adjusted returns, multiple comparisons, liquidity and missing data. Independently reproduce results.
 2. Freeze one strategy/version, run forward paper for at least the readiness window, compare quote assumptions with actual available liquidity, and audit portfolio accounting. No model-driven parameter changes while measuring that strategy.
@@ -140,3 +199,12 @@ If a remote already contains commits, do not force-push or overwrite it. Clone i
 ## 8. Scope and verification
 
 The local code and unit tests were exercised with offline fixtures and mocked data, including job leases, idempotency, budget conservation, data segregation, cost modeling, strategy activation and portfolio stops. Live Kraken and Ollama availability on your machine, sustained performance, and exchange execution are not verified. The agents are independent research workers with distinct portfolios, not self-modifying general-purpose agents; the founder implements deterministic allocation rules. The ultimate Conway-style goal is a population that learns and trades independently and pays its operating costs from real measured profits. This release does not demonstrate profitability or economic self-sufficiency.
+
+
+### Paper execution audit journal (v0.5)
+
+```sh
+python -m autarky_trade.community journal --limit 30
+```
+
+The journal records accepted simulated quotes and fills atomically with account changes. It includes side, quantity, execution price, fee, reason, and before/after cash and units. Its reconciliation checks cash, units, fees and fill counts against account balances, accounting separately for funding transfers. Existing databases receive an explicit starting baseline; earlier fills are not fabricated. Older observed quotes are ignored. These are simulated executions, not exchange confirmations or an independently authenticated ledger.
