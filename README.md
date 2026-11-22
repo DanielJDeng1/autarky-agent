@@ -73,6 +73,8 @@ Strategies are selected using training and validation data, then evaluated on a 
 
 The results are experimental. Transaction costs are simplified, parameter searches can overfit, and the program does not establish that a strategy would make money in a live market. Those limits are part of the research record, not a reason to hide unsuccessful trials. See [research notes](docs/research.md).
 
+For example, the seeded offline demonstration selected a 12/48-window trend candidate with a test return of about **+0.06%**. Its higher-cost stress return was **-0.69%**, so it was rejected. The reversion and breakout candidates also failed. The demo reports these outcomes instead of forcing an approval.
+
 ## Code map
 
 | File | Responsibility |
