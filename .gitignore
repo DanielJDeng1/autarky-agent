@@ -1,5 +1,27 @@
+# Python
 __pycache__/
-*.pyc
-data/
-.env
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Local research state and credentials
+data/
+history/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
+.env.*
+!.env.example
+
+# Generated files
+coverage.xml
+.coverage
+htmlcov/
+*.log
