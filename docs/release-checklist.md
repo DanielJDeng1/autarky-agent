@@ -18,7 +18,7 @@ This is a **public-source release checklist**, not a claim that the system is su
 - [ ] Verify a long-running worker cycle and a restored backup on a different machine
 - [ ] Scan all committed Git history, not just current files, for credentials and private information
 - [ ] Inspect any screenshots, logs, databases, or local configuration before sharing
-- [ ] Decide on an open-source license; none is supplied until the owner chooses
+- [x] Select a license and add its full text: MIT License (LICENSE)
 - [ ] Confirm the README matches actual observed behavior
 - [ ] Obtain explicit owner approval before making the repository public
 

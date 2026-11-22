@@ -98,3 +98,7 @@ python -m autarky_trade.demo
 ```
 
 CI runs the checks on Python 3.11 and 3.12. The repository deliberately excludes local databases, data archives, environment files, and model caches.
+
+## License
+
+Autarky is released under the [MIT License](LICENSE). The license permits use, modification, and redistribution, including commercial use, as long as the copyright and license notice is retained. It comes without warranty.

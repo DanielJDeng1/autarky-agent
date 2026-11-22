@@ -14,4 +14,4 @@ Bug fixes should include a regression test. If you change a cost assumption, res
 
 Documentation should state what the program does and how to verify it. Avoid claiming that an experiment demonstrates profitability or autonomous operation unless there is evidence.
 
-The public license has not been chosen yet. Do not assume redistribution rights until the owner adds one.
+Autarky is licensed under the [MIT License](LICENSE). Contributions submitted for inclusion should be compatible with that license. Preserve required notices when reusing third-party code.
