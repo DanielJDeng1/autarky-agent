@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import asdict
 import json
+import logging
 import math
 from pathlib import Path
 import sqlite3
@@ -73,22 +74,88 @@ def config(path):
         return dict(row)
 
 
-def candidates(family, model, training, agent, prior):
-    # Agents have disjoint strategy families; prior reports contain training/validation only.
-    defaults=[Strategy(family,f,s,f'{agent}-{f}-{s}') for f,s in [(5,20),(12,48),(8,35),(20,80)]]
-    if not model: return defaults
-    returns=[b.close/a.close-1 for a,b in zip(training,training[1:])]
-    summary={'n':len(training),'return':training[-1].close/training[0].close-1,'mean':sum(returns)/len(returns),'volatility':math.sqrt(sum(x*x for x in returns)/len(returns)),'prior_training_validation':prior}
-    schema={'type':'object','properties':{'strategies':{'type':'array','maxItems':5,'items':{'type':'object','properties':{'fast':{'type':'integer'},'slow':{'type':'integer'}},'required':['fast','slow'],'additionalProperties':False}}},'required':['strategies'],'additionalProperties':False}
-    r=request('http://127.0.0.1:11434/api/chat',{'model':model,'stream':False,'format':schema,'messages':[{'role':'user','content':f'You are independent research agent {agent}, specializing in {family}. Propose up to five hypotheses with 2 <= fast < slow <= 100. Training-only evidence: {encode(summary)}. Avoid claims of future profit.'}],'options':{'temperature':.4,'num_predict':512}})
-    proposed=json.loads(r['message']['content'])['strategies']
-    for x in proposed[:5]:
-        try:
-            s=Strategy(family,x['fast'],x['slow'],f'{agent}-{x["fast"]}-{x["slow"]}')
-            if s not in defaults: defaults.append(s)
-        except (KeyError,TypeError,ValueError): continue
-    return defaults
 
+def candidates(family, model, training, agent, prior):
+    """Generate bounded strategy proposals; keep baseline research available offline.
+
+    The model sees training summaries and prior training/validation outcomes.
+    It never sees the reserved holdout, trading credentials, or executable code.
+    """
+    defaults = [
+        Strategy(family, fast, slow, f'{agent}-{fast}-{slow}')
+        for fast, slow in ((5, 20), (12, 48), (8, 35), (20, 80))
+    ]
+    if not model:
+        return defaults
+    if len(training) < 2:
+        raise ValueError('Insufficient training observations for model proposals')
+
+    returns = [later.close / earlier.close - 1 for earlier, later in zip(training, training[1:])]
+    summary = {
+        'n': len(training),
+        'return': training[-1].close / training[0].close - 1,
+        'mean': sum(returns) / len(returns),
+        'volatility': math.sqrt(sum(value * value for value in returns) / len(returns)),
+        'prior_training_validation': prior,
+    }
+    schema = {
+        'type': 'object',
+        'properties': {
+            'strategies': {
+                'type': 'array',
+                'maxItems': 5,
+                'items': {
+                    'type': 'object',
+                    'properties': {'fast': {'type': 'integer'}, 'slow': {'type': 'integer'}},
+                    'required': ['fast', 'slow'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+        'required': ['strategies'],
+        'additionalProperties': False,
+    }
+    prompt = (
+        f'Propose up to five pairs of integer moving-window parameters for the {family} '
+        f'strategy family. Each must satisfy 2 <= fast < slow <= 100. '
+        f'Use only the training summary below; no test data is provided. '
+        f'Return a JSON object containing a strategies array with fast and slow fields. '
+        f'Training summary: {encode(summary)}'
+    )
+    try:
+        response = request(
+            'http://127.0.0.1:11434/api/chat',
+            {
+                'model': model,
+                'stream': False,
+                'format': schema,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'options': {'temperature': 0.4, 'num_predict': 512},
+            },
+        )
+        proposals = json.loads(response['message']['content'])['strategies']
+        if not isinstance(proposals, list):
+            raise ValueError('Model strategies must be a list')
+    except (OSError, TimeoutError, ValueError, TypeError, KeyError) as exc:
+        logging.warning(
+            'Model proposals unavailable for %s; continuing with four fixed baselines: %s',
+            agent, exc,
+        )
+        return defaults
+
+    seen = {(strategy.kind, strategy.fast, strategy.slow) for strategy in defaults}
+    for proposal in proposals[:5]:
+        try:
+            strategy = Strategy(family, proposal['fast'], proposal['slow'],
+                                f'{agent}-{proposal["fast"]}-{proposal["slow"]}')
+        except (KeyError, TypeError, ValueError):
+            logging.warning('Ignoring invalid model proposal for %s', agent)
+            continue
+        key = (strategy.kind, strategy.fast, strategy.slow)
+        if key not in seen:
+            defaults.append(strategy)
+            seen.add(key)
+    return defaults
 
 def research(path, bars, source, model=None, now=None):
     if source not in ('synthetic','csv','kraken'): raise ValueError('Unknown data source')
@@ -233,17 +300,53 @@ def status(path):
         return {'mode':'PAPER ONLY','pair':t['pair'],'interval':t['interval'],'initial':t['initial'],'equity':equity,'net_pnl':equity-t['initial'],'reserve':t['reserve'],'stopped':bool(t['stopped']),'last_ts':t['last_ts'],'last_holdout':t['last_holdout'],'agents':agents}
 
 
+def doctor(path, now=None):
+    """Inspect local state without contacting a provider or modifying the database."""
+    now = int(time.time()) if now is None else now
+    database_path = Path(path)
+    if not database_path.is_file():
+        return {'ok': False, 'database': str(database_path), 'issues': ['Database not initialized']}
+
+    try:
+        state = status(path)
+    except (ValueError, TypeError, sqlite3.Error) as exc:
+        return {'ok': False, 'database': str(database_path), 'issues': [f'Database unreadable: {exc}']}
+
+    issues = []
+    if state['last_ts'] == 0:
+        issues.append('No market cycles have been recorded')
+    else:
+        interval_seconds = state['interval'] * 60
+        age = now - (state['last_ts'] + interval_seconds)
+        if age < -interval_seconds:
+            issues.append('Stored candle is in the future relative to the local clock')
+        elif age > interval_seconds + 120:
+            issues.append('Market data is stale; check the polling process')
+    if state['stopped']:
+        issues.append('The operator or a risk limit has halted the portfolio')
+
+    return {
+        'ok': not issues,
+        'database': str(database_path),
+        'market': state['pair'],
+        'last_candle': state['last_ts'],
+        'stopped': state['stopped'],
+        'issues': issues,
+    }
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument('--db',default='data/community.sqlite'); sub=p.add_subparsers(dest='cmd',required=True)
     i=sub.add_parser('init'); i.add_argument('--pair',default='XBTUSD'); i.add_argument('--interval',type=int,default=60); i.add_argument('--capital',type=float,default=1000)
     r=sub.add_parser('research'); r.add_argument('--source',choices=['synthetic','csv','kraken'],default='kraken'); r.add_argument('--csv'); r.add_argument('--model')
     d=sub.add_parser('run'); d.add_argument('--model'); d.add_argument('--poll',type=int,default=60); d.add_argument('--research-hours',type=int,default=24); d.add_argument('--once',action='store_true'); d.add_argument('--paper-only',action='store_true')
     rl=sub.add_parser('research-loop'); rl.add_argument('--model'); rl.add_argument('--hours',type=int,default=24); rl.add_argument('--once',action='store_true')
-    sub.add_parser('status'); sub.add_parser('rebalance'); sub.add_parser('history'); sub.add_parser('trials'); sub.add_parser('stop'); sub.add_parser('readiness')
+    sub.add_parser('status'); sub.add_parser('doctor'); sub.add_parser('rebalance'); sub.add_parser('history'); sub.add_parser('trials'); sub.add_parser('stop'); sub.add_parser('readiness')
     x=p.parse_args()
     def out(v): print(json.dumps(v,indent=2,allow_nan=False),flush=True)
     if x.cmd=='init': init(x.db,x.pair,x.interval,x.capital); out(status(x.db)); return
     if x.cmd=='status': out(status(x.db)); return
+    if x.cmd=='doctor': out(doctor(x.db)); return
     if x.cmd=='rebalance': out(rebalance(x.db)); return
     if x.cmd=='stop':
         with db(x.db) as c:
