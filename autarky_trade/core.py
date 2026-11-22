@@ -32,23 +32,60 @@ BASELINES=[Strategy('trend',5,20,'trend-5-20'),Strategy('trend',12,48,'trend-12-
 
 def request(url, payload=None):
     data=json.dumps(payload).encode() if payload is not None else None
-    req=urllib.request.Request(url,data=data,headers={'User-Agent':'Autarky-lab/0.2','Content-Type':'application/json'})
+    req=urllib.request.Request(url,data=data,headers={'User-Agent':'Autarky-research/0.4','Content-Type':'application/json'})
     with urllib.request.urlopen(req,timeout=120) as r: return json.load(r)
 
+
 def validate(bars, interval=None):
-    if len(bars)<220: raise ValueError('Need at least 220 complete candles; use longer CSV history for serious research')
-    for i,b in enumerate(bars):
-        if not all(math.isfinite(v) for v in (b.open,b.high,b.low,b.close,b.volume)) or min(b.open,b.high,b.low,b.close)<=0 or b.volume<0 or b.low>min(b.open,b.close) or b.high<max(b.open,b.close): raise ValueError('Invalid candle')
-        if i and (b.ts<=bars[i-1].ts or (interval and b.ts-bars[i-1].ts!=interval)): raise ValueError('Duplicate, unsorted or missing candle')
+    """Reject malformed or discontinuous market data before any evaluation.
+
+    Historical gaps cannot be silently treated as evenly spaced observations.
+    Run `python -m autarky_trade.data_audit inspect` to locate them.
+    """
+    if interval is not None and (type(interval) is not int or interval <= 0):
+        raise ValueError('Interval must be a positive number of seconds')
+    if len(bars) < 220:
+        raise ValueError('Need at least 220 complete candles')
+
+    previous = None
+    for index, bar in enumerate(bars):
+        if type(bar.ts) is not int or bar.ts <= 0:
+            raise ValueError(f'Invalid timestamp at bar {index}')
+        values = (bar.open, bar.high, bar.low, bar.close, bar.volume)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f'Non-finite price or volume at bar {index}')
+        if min(bar.open, bar.high, bar.low, bar.close) <= 0 or bar.volume < 0:
+            raise ValueError(f'Invalid price or volume at bar {index}')
+        if bar.low > min(bar.open, bar.close) or bar.high < max(bar.open, bar.close):
+            raise ValueError(f'Inconsistent OHLC range at bar {index}')
+        if previous is not None:
+            elapsed = bar.ts - previous
+            if elapsed <= 0:
+                raise ValueError(f'Duplicate or unsorted timestamp at bar {index}')
+            if interval is not None and elapsed != interval:
+                raise ValueError(f'Missing or irregular candle before bar {index}')
+        previous = bar.ts
     return bars
 
-def load_csv(path,interval=3600):
-    with open(path,newline='') as f:
-        reader=csv.reader(f); rows=[]
-        for i,r in enumerate(reader):
-            if i==0 and r[0].lower() in ('timestamp','time','ts'): continue
-            rows.append(Bar(int(r[0]),*(float(x) for x in r[1:6])))
-    return validate(rows,interval)
+
+def load_csv(path, interval=3600):
+    """Read timestamp, OHLC and volume, ignoring optional trailing columns."""
+    rows = []
+    with open(path, newline='', encoding='utf-8-sig') as handle:
+        reader = csv.reader(handle)
+        for line_number, raw in enumerate(reader, start=1):
+            if not raw or not any(field.strip() for field in raw):
+                continue
+            if line_number == 1 and raw[0].strip().lower() in ('timestamp', 'time', 'ts'):
+                continue
+            if len(raw) < 6:
+                raise ValueError(f'CSV line {line_number}: expected timestamp, OHLC and volume')
+            try:
+                row = Bar(int(raw[0].strip()), *(float(value) for value in raw[1:6]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'CSV line {line_number}: invalid timestamp or numeric value') from exc
+            rows.append(row)
+    return validate(rows, interval)
 
 def kraken(pair='XBTUSD',interval=60):
     if pair not in ('XBTUSD','ETHUSD') or interval not in (15,60,240,1440): raise ValueError('Unsupported pair/interval')
@@ -64,7 +101,7 @@ def quote(pair):
     r=request('https://api.kraken.com/0/public/Ticker?'+urllib.parse.urlencode({'pair':pair}))
     if r['error']: raise RuntimeError(r['error'])
     d=next(iter(r['result'].values())); bid,ask=float(d['b'][0]),float(d['a'][0])
-    if not 0<bid<=ask or not math.isfinite(ask): raise ValueError('Invalid quote')
+    if not all(math.isfinite(value) for value in (bid, ask)) or not 0 < bid <= ask: raise ValueError('Invalid quote')
     return bid,ask
 
 def synthetic(n=1000):
@@ -101,15 +138,32 @@ class Account:
         e=self.equity(price); self.peak=max(self.peak,e); self.drawdown=max(self.drawdown,1-e/self.peak)
         if self.drawdown>=.08: self.stopped=True
 
-def backtest(bars,strategy,costs,start,end,capital=1000.):
-    a=Account(cash=capital,peak=capital); closes=[b.close for b in bars[:start]]
-    for b in bars[start:end]:
-        # Signal sees only prior completed candles. Fill at next open, not same close.
-        a.fill(strategy.signal(closes) and not a.stopped,b.open,b.open,costs)
-        a.mark(b.close); closes.append(b.close)
-    if a.units: a.fill(False,bars[end-1].close,bars[end-1].close,costs)
-    a.mark(bars[end-1].close)
-    return {'return':a.cash/capital-1,'trades':a.trades,'fees':a.fees,'drawdown':a.drawdown,'stopped':a.stopped}
+
+def backtest(bars, strategy, costs, start, end, capital=1000.):
+    """Signal on completed candles; fill at the following candle's open."""
+    if not 0 < start < end <= len(bars):
+        raise ValueError('Invalid backtest window')
+    if not math.isfinite(capital) or capital <= 0:
+        raise ValueError('Starting capital must be positive and finite')
+
+    account = Account(cash=capital, peak=capital)
+    closes = [bar.close for bar in bars[:start]]
+    for bar in bars[start:end]:
+        should_buy = strategy.signal(closes) and not account.stopped
+        account.fill(should_buy, bar.open, bar.open, costs)
+        account.mark(bar.close)
+        closes.append(bar.close)
+
+    if account.units:
+        account.fill(False, bars[end - 1].close, bars[end - 1].close, costs)
+    account.mark(bars[end - 1].close)
+    return {
+        'return': account.cash / capital - 1,
+        'trades': account.trades,
+        'fees': account.fees,
+        'drawdown': account.drawdown,
+        'stopped': account.stopped,
+    }
 
 def evaluate(bars,strategies,costs):
     n=len(bars); split=int(n*.6); hold=int(n*.8)
