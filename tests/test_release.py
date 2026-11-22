@@ -64,7 +64,7 @@ class DataTests(unittest.TestCase):
             extract_suffix(self.source, output)
 
     def test_malformed_csv_line_has_context(self):
-        self.source.write_text('timestamp,open,high,low,close,volume\\n1,2,3\\n')
+        self.source.write_text('timestamp,open,high,low,close,volume\n1,2,3\n')
         with self.assertRaisesRegex(ValueError, 'Line 2'):
             inspect(self.source)
 
