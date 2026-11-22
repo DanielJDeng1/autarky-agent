@@ -57,6 +57,16 @@ The model sees training statistics and past training/validation summaries. It do
 
 For sustained research, the coordinator and workers can run as separate terminal processes. See [operations](docs/operations.md).
 
+## Local research monitor
+
+After initializing a database, start the read-only operator page:
+
+```sh
+python -m autarky_trade.dashboard --db data/btc.sqlite --port 8765
+```
+
+Open `http://127.0.0.1:8765`. The page shows simulated equity history, per-agent status, recent events and worker jobs. It updates every 15 seconds and has no action buttons. The server binds only to loopback and doesn't require internet access.
+
 ## What the results mean
 
 Strategies are selected using training and validation data, then evaluated on a chronological holdout and again with higher assumed trading costs. The coordinator reserves a test interval before workers begin, and it never presents that interval as unseen data again if the batch fails.

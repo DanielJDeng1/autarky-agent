@@ -48,6 +48,14 @@ Omit `--model` to use only deterministic baselines. Start one worker at a time i
 
 Do not run the single-process research command alongside an unfinished queued research batch.
 
+## Read-only dashboard
+
+```sh
+python -m autarky_trade.dashboard --db data/btc.sqlite --port 8765
+```
+
+Open `http://127.0.0.1:8765`. It shows observed simulated equity, agents, recent research events and queued jobs. Only the local browser can reach it; there are no HTTP write operations.
+
 ## Simulated account loop
 
 ```sh
